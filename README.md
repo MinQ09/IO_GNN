@@ -1,4 +1,4 @@
-# IO-GNN - Graph-constrained LSTM for Inter-Industry Forecasting
+# IO-GNN - Graph-constrained LSTM for Inter-Industry Forecasting based on the Input-Output Table
 
 Minimal, research-grade implementation of our **ChebDirConv + GC-LSTM**
 architecture for simultaneous prediction of  
