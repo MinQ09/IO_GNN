@@ -1,0 +1,7 @@
+torch>=2.0
+torch-geometric>=2.5
+numpy
+pandas
+scipy
+tqdm
+pyyaml
