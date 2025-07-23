@@ -19,13 +19,13 @@ class Config:
     scalers_fname: str = "scalers.pkl"        # 파일명만 보관
 
     # ────────── Window & Scaling ──────────
-    window : int  = 300
+    window : int  = 5
     use_standard_scaler: bool = True
     save_scalers       : bool = True         # 학습 후 저장 여부
 
     # ────────── Training ──────────
     batch_size   : int = 8
-    epochs       : int = 5
+    epochs       : int = 300
     lr           : float = 5e-4
     weight_decay : float = 1e-4
     patience     : int = 30
