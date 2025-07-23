@@ -19,7 +19,7 @@ class Config:
     scalers_fname: str = "scalers.pkl"        # 파일명만 보관
 
     # ────────── Window & Scaling ──────────
-    window : int  = 5
+    window : int  = 300
     use_standard_scaler: bool = True
     save_scalers       : bool = True         # 학습 후 저장 여부
 
