@@ -1,7 +1,20 @@
-torch>=2.0
+# ───── core ─────
+torch>=2.0             # GPU or CPU build picked automatically on Colab / pip
+torchvision>=0.15      # (nice to have; no harm if unused)
+torchaudio>=2.0        # (optional, but matches the torch version)
+
+# ───── PyG ecosystem ─────
+#   These wheels are hosted by the PyG team; pip will find the right CUDA / CPU build.
 torch-geometric>=2.5
-numpy
-pandas
-scipy
-tqdm
-pyyaml
+torch-scatter>=2.1
+torch-sparse>=0.6
+torch-cluster>=1.6
+torch-spline-conv>=1.2
+
+# ───── data / utils ─────
+numpy>=1.23
+pandas>=1.5
+scipy>=1.10
+scikit-learn>=1.3      # <-- needed for StandardScaler
+tqdm>=4.65
+pyyaml>=6.0
