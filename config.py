@@ -1,57 +1,60 @@
-# config.py
+# config.py  ─────────────────────────────────────────────────────────────
 from __future__ import annotations
-
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import List, Union
 import yaml, torch
 
+
 @dataclass
 class Config:
     """
-    Experiment-wide hyperparameters (StandardScaler 버전).
-    YAML ↔ dataclass 직렬화 시 Path / 숫자형 모두 안전 변환.
+    IO-GNN 실험용 하이퍼파라미터 (StandardScaler 버전).
     """
 
     # ────────── Paths ──────────
-    data_dir : Path = Path("/Users/mingyukim/Desktop/JP/data")
-    out_dir  : Path = Path("/Users/mingyukim/Desktop/JP/results")
-    scalers_fname: str = "scalers.pkl"        # 파일명만 보관
+    data_dir: Path = Path("/Users/mingyukim/Desktop/JP/data")
+    out_dir:  Path = Path("/Users/mingyukim/Desktop/JP/results")
+    scalers_fname: str = "scalers.pkl"
 
     # ────────── Window & Scaling ──────────
-    window : int  = 5
+    window: int = 3                       # ↓ 5 → 3  (VA에 유리하도록 짧은 윈도우)
     use_standard_scaler: bool = True
-    save_scalers       : bool = True         # 학습 후 저장 여부
+    save_scalers: bool = True
 
     # ────────── Training ──────────
-    batch_size   : int = 8
-    epochs       : int = 300
-    lr           : float = 5e-4
-    weight_decay : float = 1e-4
-    patience     : int = 30
+    batch_size:   int   = 8
+    epochs:       int   = 300
+    lr:           float = 5e-4
+    weight_decay: float = 1e-4
+    patience:     int   = 50             # warm-up 증가에 맞춰 early-stop 여유
 
     # ────────── PINN / Multitask ──────────
-    lambda_max : float = 0.1
-    warmup     : int   = 100
-    beta_x     : float = 0.0
-    beta_init  : float = 0.0
+    lambda_max: float = 0.5              # ↑ 0.1 → 0.5
+    warmup:     int   = 500              # ↑ 100 → 500
+    beta_x:     float = 0.0
+    beta_init:  float = 0.1              # ↑ 0.0 → 0.1
 
     # ────────── Model ──────────
-    hidden      : int   = 512
-    k           : int   = 5
-    alpha       : float = 0.5
-    dropout     : float = 0.3
-    att_hidden  : int   = 64
-    depth_edge  : int   = 3
+    hidden:     int   = 512
+    k:          int   = 5
+    alpha:      float = 0.5
+    dropout:    float = 0.3
+    att_hidden: int   = 64
+    depth_edge: int   = 3
 
     # ────────── Experiment sweep ──────────
-    seeds            : List[int]   = field(default_factory=lambda: [17])
-    lambda_candidates: List[float] = field(default_factory=lambda: [0.1])
-    beta_candidates  : List[float] = field(default_factory=lambda: [0.0])
+    seeds: List[int] = field(default_factory=lambda: [17])
+    lambda_candidates: List[float] = field(      # 간단한 격자 탐색
+        default_factory=lambda: [0.3, 0.5, 1.0]
+    )
+    beta_candidates:   List[float] = field(
+        default_factory=lambda: [0.0, 0.1, 0.2]
+    )
 
     # ────────── Misc ──────────
     log_every: int = 10
-    device   : str = field(init=False)
+    device:    str = field(init=False)
 
     # ----------------------------------------------------------
     def __post_init__(self):
@@ -64,23 +67,22 @@ class Config:
         print("▶ Using StandardScaler" if self.use_standard_scaler
               else "▶ Using *deprecated* legacy scaling")
 
-    # ---------- Helper 프로퍼티 ----------
+    # ---------- Helper ----------
     @property
     def scalers_path(self) -> Path:
-        """ out_dir 변경 시 자동 반영되는 Scaler 경로 """
         return self.out_dir / self.scalers_fname
 
     # ---------- YAML I/O ----------
     def save(self, path: Union[str, Path]) -> None:
-        # Path 객체 → str 로 변환 후 덤프
-        data = {k: (str(v) if isinstance(v, Path) else v)
-                for k, v in asdict(self).items()}
+        data = {
+            k: (str(v) if isinstance(v, Path) else v)
+            for k, v in asdict(self).items()
+        }
         Path(path).write_text(yaml.safe_dump(data, sort_keys=False))
 
     @classmethod
     def load(cls, path: Union[str, Path]) -> "Config":
         raw = yaml.safe_load(Path(path).read_text())
-        # 경로형 필드를 다시 Path 로 캐스팅
         for k in ("data_dir", "out_dir"):
             if k in raw:
                 raw[k] = Path(raw[k])
@@ -88,6 +90,7 @@ class Config:
 
     # ---------- Convenience ----------
     def to_dict(self) -> dict:
-        """ JSON / 로그용 dict (Path → str) """
-        return {k: (str(v) if isinstance(v, Path) else v)
-                for k, v in asdict(self).items()}
+        return {
+            k: (str(v) if isinstance(v, Path) else v)
+            for k, v in asdict(self).items()
+        }
