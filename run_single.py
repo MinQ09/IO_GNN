@@ -65,7 +65,7 @@ def run_single(cfg: Any, seed: int, *, kind: str = "Z"
     mk_loader = lambda Y, shuf, bs: DataLoader(
         GraphWindowDataset(Y, cfg, scalers, fit_scalers=False),
         batch_size=bs, shuffle=shuf,
-        collate_fn=collate_window, pin_memory=True
+        collate_fn=collate_window, pin_memory=False
     )
 
     tr_ld = mk_loader(tr_yrs, True,  cfg.batch_size)
