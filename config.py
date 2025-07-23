@@ -25,13 +25,13 @@ class Config:
 
     # ────────── Training ──────────
     batch_size   : int = 8
-    epochs       : int = 300
+    epochs       : int = 5
     lr           : float = 5e-4
     weight_decay : float = 1e-4
-    patience     : int = 50
+    patience     : int = 30
 
     # ────────── PINN / Multitask ──────────
-    lambda_max : float = 1.0
+    lambda_max : float = 0.1
     warmup     : int   = 100
     beta_x     : float = 0.0
     beta_init  : float = 0.0
@@ -46,7 +46,7 @@ class Config:
 
     # ────────── Experiment sweep ──────────
     seeds            : List[int]   = field(default_factory=lambda: [17])
-    lambda_candidates: List[float] = field(default_factory=lambda: [1.0])
+    lambda_candidates: List[float] = field(default_factory=lambda: [0.1])
     beta_candidates  : List[float] = field(default_factory=lambda: [0.0])
 
     # ────────── Misc ──────────

@@ -191,7 +191,7 @@ def run_single(
     res = {k: [] for k in ("rmse", "mae", "smape", "r2", "rho", "cvr")}
 
     with torch.no_grad():
-        for seqs, tgts in test_ld:
+        for seqs, tgts in ts_ld:
             seqs = [[g.to(cfg.device) for g in s] for s in seqs]
             tgts = [g.to(cfg.device) for g in tgts]
 
@@ -232,7 +232,7 @@ def run_single(
     dump_pred_matrices(
         model,
         scalers_path,      # pass path, not dict
-        years=test_y,
+        years=ts_y,
         save_dir=save_dir,
         cfg=cfg,
         kind=kind,
