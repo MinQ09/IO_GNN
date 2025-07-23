@@ -22,6 +22,7 @@ def dump_pred_matrices(
     scalers_path: Path,
     years: List[int],
     save_dir: Path,
+    cfg,
     *,
     kind: str = "Z",             # "Z"  or  "VA"
     save_x: bool = True,
@@ -46,7 +47,7 @@ def dump_pred_matrices(
         scalers: Dict[str, Any] = pickle.load(f)
 
     # local import to avoid circular reference
-    from data import GraphWindowDatasetStandardized as GraphWindowDataset
+    from data_io import GraphWindowDataset
 
     ds = GraphWindowDataset(years, cfg, scalers=scalers, fit_scalers=False)
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -60,7 +61,7 @@ def dump_pred_matrices(
             if kind == "Z":
                 p_z_std, att_out, att_in = model([seq], [tgt])
                 # inverse-transform edges
-                edge_scaler: StandardScaler = scalers["Z_edge"]
+                edge_scaler: StandardScaler = scalers["edge_Z"]
                 p_raw = torch.from_numpy(
                     edge_scaler.inverse_transform(p_z_std.cpu().numpy().reshape(-1,1))
                 ).flatten().to(tgt.edge_attr.device)
@@ -72,7 +73,7 @@ def dump_pred_matrices(
             else:  # VA
                 p_va_std, att_out, att_in = model([seq], [tgt])
                 # inverse-transform VA per node
-                va_scaler: StandardScaler = scalers["A_node"]["value_added"]
+                va_scaler: StandardScaler = scalers["node"]["value_added"]
                 p_raw = torch.from_numpy(
                     va_scaler.inverse_transform(p_va_std.cpu().numpy().reshape(-1,1))
                 ).flatten().to(tgt.va.device)
@@ -112,7 +113,7 @@ def dump_pred_matrices(
         # ─────── optional node features ───────
         if save_x:
             # inverse-transform node features FD, VA
-            feat_scaler: StandardScaler = scalers["A_node"]["node_features"]
+            feat_scaler: StandardScaler = scalers["node"]["node_features"]
             x_std = tgt.x[:, :2].cpu().numpy()
             x_raw = feat_scaler.inverse_transform(x_std)
             pd.DataFrame(x_raw, columns=["FD", "VA"]) \
@@ -160,9 +161,9 @@ def inverse_transform_predictions(
     """
     arr = pred_std.detach().cpu().numpy().reshape(-1, 1)
     if kind == "Z":
-        scaler = scalers["Z_edge"]
+        scaler = scalers["edge_Z"]
     else:
-        scaler = scalers["A_node"]["value_added"]
+        scaler = scalers["node"]["value_added"]
     orig = scaler.inverse_transform(arr).flatten()
     return torch.from_numpy(orig).to(pred_std.device)
 
@@ -177,8 +178,8 @@ def inverse_transform_targets(
     """
     arr = tgt_std.detach().cpu().numpy().reshape(-1, 1)
     if kind == "Z":
-        scaler = scalers["Z_edge"]
+        scaler = scalers["edge_Z"]
     else:
-        scaler = scalers["A_node"]["value_added"]
+        scaler = scalers["node"]["value_added"]
     orig = scaler.inverse_transform(arr).flatten()
     return torch.from_numpy(orig).to(tgt_std.device)

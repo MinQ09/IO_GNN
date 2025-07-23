@@ -27,7 +27,7 @@ from utils import set_seed
 from run_single import run_single
 
 # ----------------------------------------------------------------------
-Metrics: List[str] = ["RMSE", "MAE", "SMAPE", "R2", "rho", "CVR"]
+Metrics: List[str] = ["RMSE", "MAE", "SMAPE", "R2", "RHO"]
 
 # ----------------------------------------------------------------------
 def run_all(cfg: Config, kinds: List[str]) -> None:
