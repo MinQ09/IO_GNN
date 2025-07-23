@@ -103,7 +103,9 @@ def load_edges(
         df = pd.concat([df, missing], ignore_index=True)
 
     edge_idx = torch.tensor(df.iloc[:, :2].values.T, dtype=torch.long)
-    edge_val = df[value_col].values.reshape(-1, 1).astype(np.float32)
+    edge_val = (df.iloc[:, value_col]
+                if isinstance(value_col, int)
+                else df[value_col]).values.reshape(-1, 1).astype(np.float32)
 
     if scaler is None:
         scaler = _identity_scaler() if not apply_scaler else StandardScaler()

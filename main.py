@@ -38,7 +38,7 @@ def main() -> None:
 
                 for kind in kinds:
                     # 1) 학습 + 테스트
-                    model, hist, _, test_metrics = run_single(cfg, seed, kind=kind)
+                    model, hist, _, test_metrics = run_single(cfg, seed, kind=kind, scalers_path=cfg.scalers_path)
 
                     # 2) summary 갱신
                     for m in metrics_all:
