@@ -8,9 +8,6 @@ import yaml, torch
 
 @dataclass
 class Config:
-    """
-    IO-GNN 실험용 하이퍼파라미터 (StandardScaler 버전).
-    """
 
     # ────────── Paths ──────────
     data_dir: Path = Path("/Users/mingyukim/Desktop/JP/data")
@@ -18,16 +15,16 @@ class Config:
     scalers_fname: str = "scalers.pkl"
 
     # ────────── Window & Scaling ──────────
-    window: int = 3                       # ↓ 5 → 3  (VA에 유리하도록 짧은 윈도우)
+    window: int = 3                      
     use_standard_scaler: bool = True
     save_scalers: bool = True
 
     # ────────── Training ──────────
     batch_size:   int   = 8
-    epochs:       int   = 300
+    epochs:       int   = 150
     lr:           float = 5e-4
     weight_decay: float = 1e-4
-    patience:     int   = 50             # warm-up 증가에 맞춰 early-stop 여유
+    patience:     int   = 50             
 
     # ────────── PINN / Multitask ──────────
     lambda_max: float = 0.5              # ↑ 0.1 → 0.5
