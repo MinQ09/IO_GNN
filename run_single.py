@@ -62,11 +62,15 @@ def run_single(cfg: Any, seed: int, *, kind: str = "Z"
     if cfg.save_scalers:
         pickle.dump(scalers, open(cfg.scalers_path, "wb"))
 
-    mk_loader = lambda Y, shuf, bs: DataLoader(
-        GraphWindowDataset(Y, cfg, scalers, fit_scalers=False),
-        batch_size=bs, shuffle=shuf,
-        collate_fn=collate_window, pin_memory=False
-    )
+    def mk_loader(years, shuffle, bs):
+        use_pin = (cfg.device == "cpu")          # 또는 그냥 False 로 고정
+        return DataLoader(
+            GraphWindowDataset(years, cfg, scalers, fit_scalers=False),
+            batch_size=bs,
+            shuffle=shuffle,
+            collate_fn=collate_window,
+            pin_memory=use_pin,                  # ← 수정
+        )
 
     tr_ld = mk_loader(tr_yrs, True,  cfg.batch_size)
     vl_ld = mk_loader(vl_yrs, False, cfg.batch_size)
