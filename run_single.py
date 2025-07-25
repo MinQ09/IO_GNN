@@ -101,7 +101,7 @@ def run_single(
 
     # ─── DATASETS & SCALERS ───────────────────────────────
     years = list(range(1, 73))  # 1..72 inclusive
-    tr_y, vl_y, ts_y = years[:-10], years[-10:-6], years[-6:-2]
+    tr_y, vl_y, ts_y = years[:-9], years[-9:-5], years[-5:-1]
 
     tr_ds = GraphWindowDataset(tr_y, cfg, scalers=None, fit_scalers=True)
     scalers = tr_ds.get_scalers()
