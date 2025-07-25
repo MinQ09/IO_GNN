@@ -23,7 +23,7 @@ from sklearn.preprocessing import StandardScaler
 from constants import EPS  # global constant
 
 # ──────────────── constants ────────────────
-NODE_COLS: Sequence[str] = ("Imports", "Exports", "Final_Demand")
+NODE_COLS: Sequence[str] = ("Import", "Export", "Final_Demand")
 
 # ──────────────── helpers ────────────────
 def _safe_read_csv(csv_path: Path) -> pd.DataFrame:
@@ -169,15 +169,13 @@ class GraphWindowDataset(Dataset):
 
         self.graphs_A, self.graphs_Z = [], []
 
-        for i, y in enumerate(years):
-            fit = fit_scalers if i == 0 else False
-
+        for y in years:
             g_A, self.scalers["node"], self.scalers["edge_A"] = make_graph(
                 base / f"X_{y}.csv",
                 base / f"Af_{y}.csv",
                 node_scalers=self.scalers["node"],
                 edge_scaler=self.scalers["edge_A"],
-                fit_scalers=fit,
+                fit_scalers=fit_scalers,
                 apply_edge_scaler=False,   # Af stays 0-1
             )
             g_Z, _, self.scalers["edge_Z"] = make_graph(
@@ -185,7 +183,7 @@ class GraphWindowDataset(Dataset):
                 base / f"Zf_{y}.csv",
                 node_scalers=self.scalers["node"],
                 edge_scaler=self.scalers["edge_Z"],
-                fit_scalers=fit,
+                fit_scalers=fit_scalers,
                 apply_edge_scaler=True,    # Z needs scaling
             )
 

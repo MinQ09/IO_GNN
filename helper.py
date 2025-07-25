@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import List, Any, Dict
+from typing import List, Any, Dict, Literal
 import pandas as pd
 import torch
 from torch import Tensor
@@ -9,10 +9,46 @@ import pickle
 from sklearn.preprocessing import StandardScaler
 
 # ───────────────────────── helper ─────────────────────────
-def _edges_to_matrix(pred: Tensor, src: Tensor, trg: Tensor, n: int) -> Tensor:
-    """1-D edge vector → (n×n) dense matrix (CPU)."""
-    mat = torch.zeros(n, n, dtype=pred.dtype, device=pred.device)
-    mat[src, trg] = pred
+def _edges_to_matrix(
+    values: Tensor,
+    src: Tensor,
+    trg: Tensor,
+    n_nodes: int,
+    *,
+    reduce: Literal["sum", "mean"] = "sum",
+) -> Tensor:
+    """
+    Convert a 1-D edge vector to an (n×n) dense matrix **with proper handling
+    of duplicate (src, trg) pairs**.
+
+    Parameters
+    ----------
+    values : Tensor
+        Edge values (shape = [E]).
+    src, trg : Tensor
+        Source and target node indices (shape = [E]).
+    n_nodes : int
+        Number of nodes in the graph.
+    reduce : {"sum", "mean"}, default "sum"
+        How to merge duplicates:
+        • "sum"  : accumulate the values (recommended for flows).
+        • "mean" : take the average.
+
+    Returns
+    -------
+    Tensor
+        Dense (n×n) matrix on CPU.
+    """
+    mat = torch.zeros(n_nodes, n_nodes, dtype=values.dtype, device=values.device)
+
+    # accumulate duplicates
+    mat.index_put_((src, trg), values, accumulate=True)
+
+    if reduce == "mean":
+        counts = torch.zeros_like(mat)
+        counts.index_put_((src, trg), torch.ones_like(values), accumulate=True)
+        mat = torch.where(counts > 0, mat / counts.clamp(min=1), mat)
+
     return mat.cpu()
 
 
@@ -22,23 +58,15 @@ def dump_pred_matrices(
     scalers_path: Path,
     years: List[int],
     save_dir: Path,
-    cfg,
+    cfg: Any | None = None,
     *,
     kind: str = "Z",             # "Z"  or  "VA"
     save_x: bool = True,
     float_fmt: str = "%.6g",     # reduce csv size / sci-notation
+    reduce: Literal["sum", "mean"] = "sum",         # how to merge parallel edges
 ) -> None:
     """
-    Save model predictions & targets as CSV files using StandardScaler.
-    Expects scalers saved via pickle at scalers_path.
-
-    kind == "Z"
-        pred_Z_###.csv , true_Z_###.csv      (n×n)
-    kind == "VA"
-        pred_VA_###.csv, true_VA_###.csv     (n,)
-    Both kinds:
-        attn_out_<kind>_###.csv , attn_in_<kind>_###.csv (n×n)
-        X_###.csv (FD, VA)  if save_x
+    Save model predictions & targets as CSV files, now **robust to parallel edges**.
     """
     assert kind in {"Z", "VA"}, "`kind` must be 'Z' or 'VA'"
 
@@ -53,46 +81,50 @@ def dump_pred_matrices(
     save_dir.mkdir(parents=True, exist_ok=True)
 
     model.eval()
+    device = next(model.parameters()).device
     for idx, (seq, tgt) in enumerate(ds):
-        seq = [g.to(next(model.parameters()).device) for g in seq]
-        tgt = tgt.to(next(model.parameters()).device)
+        seq = [g.to(device) for g in seq]
+        tgt = tgt.to(device)
 
         with torch.no_grad():
             if kind == "Z":
-                p_z_std, att_out, att_in = model([seq], [tgt])
-                # inverse-transform edges
+                p_std, att_out, att_in = model([seq], [tgt])
+
                 edge_scaler: StandardScaler = scalers["edge_Z"]
                 p_raw = torch.from_numpy(
-                    edge_scaler.inverse_transform(p_z_std.cpu().numpy().reshape(-1,1))
-                ).flatten().to(tgt.edge_attr.device)
-                # true edges: apply inverse of log1p then scaler if used similarly
-                t_std = tgt.edge_attr.cpu().numpy().reshape(-1,1)
+                    edge_scaler.inverse_transform(p_std.cpu().numpy().reshape(-1, 1))
+                ).flatten().to(device)
+
+                t_std = tgt.edge_attr.cpu().numpy().reshape(-1, 1)
                 t_raw = torch.from_numpy(
                     edge_scaler.inverse_transform(t_std)
-                ).flatten().to(tgt.edge_attr.device)
+                ).flatten().to(device)
             else:  # VA
-                p_va_std, att_out, att_in = model([seq], [tgt])
-                # inverse-transform VA per node
+                p_std, att_out, att_in = model([seq], [tgt])
+
                 va_scaler: StandardScaler = scalers["node"]["value_added"]
                 p_raw = torch.from_numpy(
-                    va_scaler.inverse_transform(p_va_std.cpu().numpy().reshape(-1,1))
-                ).flatten().to(tgt.va.device)
-                # true VA
+                    va_scaler.inverse_transform(p_std.cpu().numpy().reshape(-1, 1))
+                ).flatten().to(device)
+
                 t_raw = torch.from_numpy(
-                    va_scaler.inverse_transform(tgt.va.cpu().numpy().reshape(-1,1))
-                ).flatten().to(tgt.va.device)
+                    va_scaler.inverse_transform(tgt.va.cpu().numpy().reshape(-1, 1))
+                ).flatten().to(device)
 
         s, t = tgt.edge_index.cpu()
         n = tgt.num_nodes
 
         # ─────── predictions / targets ───────
         if kind == "Z":
-            pd.DataFrame(_edges_to_matrix(p_raw, s, t, n).numpy()) \
-              .to_csv(save_dir / f"pred_Z_{idx:03d}.csv",
-                      index=False, float_format=float_fmt)
-            pd.DataFrame(_edges_to_matrix(t_raw, s, t, n).numpy()) \
-              .to_csv(save_dir / f"true_Z_{idx:03d}.csv",
-                      index=False, float_format=float_fmt)
+            pd.DataFrame(
+                _edges_to_matrix(p_raw, s, t, n, reduce=reduce).numpy()
+            ).to_csv(save_dir / f"pred_Z_{idx:03d}.csv",
+                     index=False, float_format=float_fmt)
+
+            pd.DataFrame(
+                _edges_to_matrix(t_raw, s, t, n, reduce=reduce).numpy()
+            ).to_csv(save_dir / f"true_Z_{idx:03d}.csv",
+                     index=False, float_format=float_fmt)
         else:  # VA
             pd.DataFrame(p_raw.cpu().numpy(), columns=["VA_pred"]) \
               .to_csv(save_dir / f"pred_VA_{idx:03d}.csv",
@@ -105,21 +137,22 @@ def dump_pred_matrices(
         suffix_out = f"attn_out_{kind}_{idx:03d}.csv"
         suffix_in  = f"attn_in_{kind}_{idx:03d}.csv"
 
-        pd.DataFrame(_edges_to_matrix(att_out.cpu(), s, t, n).numpy()) \
-          .to_csv(save_dir / suffix_out, index=False, float_format=float_fmt)
-        pd.DataFrame(_edges_to_matrix(att_in.cpu(), t, s, n).numpy()) \
-          .to_csv(save_dir / suffix_in,  index=False, float_format=float_fmt)
+        pd.DataFrame(
+            _edges_to_matrix(att_out.cpu(), s, t, n, reduce=reduce).numpy()
+        ).to_csv(save_dir / suffix_out, index=False, float_format=float_fmt)
+
+        pd.DataFrame(
+            _edges_to_matrix(att_in.cpu(), t, s, n, reduce=reduce).numpy()
+        ).to_csv(save_dir / suffix_in,  index=False, float_format=float_fmt)
 
         # ─────── optional node features ───────
         if save_x:
-            # inverse-transform node features FD, VA
             feat_scaler: StandardScaler = scalers["node"]["node_features"]
             x_std = tgt.x[:, :2].cpu().numpy()
             x_raw = feat_scaler.inverse_transform(x_std)
             pd.DataFrame(x_raw, columns=["FD", "VA"]) \
               .to_csv(save_dir / f"X_{idx:03d}.csv",
                       index=False, float_format=float_fmt)
-
 
 def save_edge_attention(
     att_out: torch.Tensor,

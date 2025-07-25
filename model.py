@@ -156,9 +156,16 @@ class GCLSTMCell(nn.Module):
 
 
 # ─────────────────────── helper MLP ───────────────────────
-def mlp(d_in: int, d_hidden: int, depth: int = 3, dropout: float = 0.2) -> nn.Sequential:
-    """Stacked MLP, final ReLU enforces non-negativity."""
-    layers: list[nn.Module] = []
+def mlp(
+    d_in: int,
+    d_hidden: int,
+    depth: int = 3,
+    dropout: float = 0.2,
+    *,
+    negative_slope: float = 1e-2
+) -> nn.Sequential:
+    
+    layers: List[nn.Module] = []
     for i in range(depth):
         layers += [
             nn.Linear(d_in if i == 0 else d_hidden, d_hidden),
@@ -167,8 +174,11 @@ def mlp(d_in: int, d_hidden: int, depth: int = 3, dropout: float = 0.2) -> nn.Se
         ]
         if dropout:
             layers.append(nn.Dropout(dropout))
+    
     layers.append(nn.Linear(d_hidden, 1))
-    layers.append(nn.ReLU())
+
+    layers.append(nn.LeakyReLU(negative_slope=negative_slope, inplace=True))
+    
     return nn.Sequential(*layers)
 
 

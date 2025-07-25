@@ -12,7 +12,7 @@ def main() -> None:
     out_root.mkdir(parents=True, exist_ok=True)
 
     kinds       = ["Z", "VA"]                     # NEW
-    metrics_all = ["RMSE", "MAE", "SMAPE", "R2", "rho", "CVR"]
+    metrics_all = ["RMSE", "MAE", "SMAPE", "R2", "RHO", "CVR"]
 
     # summary[kind][(λ,β)][metric] = list over seeds
     summary: dict[str, dict[tuple[float,float], dict[str, list[float]]]] = {
@@ -38,7 +38,7 @@ def main() -> None:
 
                 for kind in kinds:
                     # 1) 학습 + 테스트
-                    model, hist, _, test_metrics = run_single(cfg, seed, kind=kind, scalers_path=cfg.scalers_path)
+                    model, hist, _, test_metrics = run_single(cfg, seed, kind=kind)
 
                     # 2) summary 갱신
                     for m in metrics_all:
