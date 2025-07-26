@@ -26,8 +26,8 @@ class Config:
     patience:     int   = 50             
     
     # ────────── PINN / Multitask ──────────
-    lambda_max: float = 1              # ↑ 0.1 → 0.5
-    warmup:     int   = 100              # ↑ 100 → 500
+    lambda_max: float = 10              # ↑ 0.1 → 0.5
+    warmup:     int   = 250              # ↑ 100 → 500
     beta_x:     float = 0.0
     beta_init:  float = 0.1              # ↑ 0.0 → 0.1
 
@@ -42,7 +42,7 @@ class Config:
     # ────────── Experiment sweep ──────────
     seeds: List[int] = field(default_factory=lambda: [17])
     lambda_candidates: List[float] = field(      # 간단한 격자 탐색
-        default_factory=lambda: [1]
+        default_factory=lambda: [10]
     )
     beta_candidates:   List[float] = field(
         default_factory=lambda: [0.0]
