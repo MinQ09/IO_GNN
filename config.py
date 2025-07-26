@@ -20,7 +20,7 @@ class Config:
 
     # ────────── Training ──────────
     batch_size:   int   = 8
-    epochs:       int   = 300
+    epochs:       int   = 500
     lr:           float = 5e-4
     weight_decay: float = 1e-4
     patience:     int   = 50             
