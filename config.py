@@ -21,8 +21,8 @@ class Config:
     # ────────── Training ──────────
     batch_size: int = 64
     epochs: int = 300
-    lr: float = 3e-3
-    weight_decay: float = 5e-4
+    lr: float = 5e-5
+    weight_decay: float = 5e-5
     patience: int = 50             
     
     # ────────── PINN / Multitask ──────────
