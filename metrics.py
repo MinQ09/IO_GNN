@@ -54,7 +54,6 @@ def safe_pearson(x: Tensor, y: Tensor) -> float:
 # ───────────── CVR in original scale ─────────── #
 @torch.inference_mode()
 def cvr_tensor_standardized(pred_std: Tensor, g: Data, scalers: dict) -> float:
-    # edge inverse transform (Z only)
     edge_scaler: StandardScaler = scalers["edge_Z"]
     pred_orig = torch.from_numpy(edge_scaler.inverse_transform(
         pred_std.cpu().numpy().reshape(-1, 1)
@@ -64,10 +63,12 @@ def cvr_tensor_standardized(pred_std: Tensor, g: Data, scalers: dict) -> float:
     n_scalers = scalers["node"]
     x_orig = torch.from_numpy(n_scalers["node_features"].inverse_transform(g.x.cpu().numpy())).to(pred_std.device)
     va_orig = torch.from_numpy(n_scalers["value_added"].inverse_transform(g.va.cpu().numpy().reshape(-1, 1)).squeeze()).to(pred_std.device)
-    tot_orig= torch.from_numpy(n_scalers["total"].inverse_transform(g.tot.cpu().numpy().reshape(-1, 1)).squeeze()).to(pred_std.device)
+    tot_orig = torch.from_numpy(n_scalers["total"].inverse_transform(g.tot.cpu().numpy().reshape(-1, 1)).squeeze()).to(pred_std.device)
 
     imp, exp, fd = x_orig.T
     src, trg = g.edge_index
+    src = src.to(pred_std.device)
+    trg = trg.to(pred_std.device)
     n = g.num_nodes
 
     row = torch.zeros(n, device=pred_std.device).index_add_(0, src, pred_orig) + fd + exp
@@ -76,8 +77,6 @@ def cvr_tensor_standardized(pred_std: Tensor, g: Data, scalers: dict) -> float:
     mismatch = (row - col).abs().sum()
     total_output = tot_orig.sum().clamp(min=EPS)
     return (mismatch / total_output).item()
-
-# nano‑mean helper remains unchanged
 
 def mean_ignore_nan(vals: List[float]) -> float:
     return float(np.nanmean(vals)) if vals else float("nan")
