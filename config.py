@@ -14,13 +14,13 @@ class Config:
     scalers_fname: str = "scalers.pkl"
 
     # ────────── Window & Scaling ──────────
-    window: int = 4                       
+    window: int = 1                       
     use_standard_scaler: bool = True
     save_scalers: bool = True  # ← Fixed: Added missing attribute
 
     # ────────── Training ──────────
     batch_size: int = 16
-    epochs: int = 500
+    epochs: int = 300
     lr: float = 5e-4
     weight_decay: float = 5e-4
     patience: int = 50             
@@ -32,7 +32,7 @@ class Config:
     beta_init: float = 0.1
 
     # ────────── Model ──────────
-    hidden: int = 768
+    hidden: int = 512
     k: int = 5
     alpha: float = 0.5
     dropout: float = 0.15
