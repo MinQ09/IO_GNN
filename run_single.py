@@ -100,8 +100,8 @@ def run_single(
     save_dir.mkdir(parents=True, exist_ok=True)
 
     # ─── DATASETS & SCALERS ───────────────────────────────
-    years = list(range(1, 56))  
-    tr_y, vl_y, ts_y = years[:-10], years[-10:-5], years[-5:]
+    years = list(range(1, 21))  
+    tr_y, vl_y, ts_y = years[:-4], years[-4:-2], years[-2:]
 
     tr_ds = GraphWindowDataset(tr_y, cfg, scalers=None, fit_scalers=True)
     scalers = tr_ds.get_scalers()
