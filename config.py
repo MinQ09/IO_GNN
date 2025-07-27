@@ -23,7 +23,7 @@ class Config:
     epochs: int = 300
     lr: float = 3e-3
     weight_decay: float = 5e-4
-    patience: int = 30             
+    patience: int = 50             
     
     # ────────── PINN / Multitask ──────────
     lambda_max: float = 0.5
