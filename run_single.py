@@ -115,7 +115,7 @@ def run_single(
             batch_size=bs,
             shuffle=shuffle,
             collate_fn=collate_window,
-            pin_memory=True,
+            pin_memory=False,
         )
 
     tr_ld, vl_ld, ts_ld = (
