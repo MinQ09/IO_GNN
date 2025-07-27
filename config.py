@@ -14,7 +14,7 @@ class Config:
     scalers_fname: str = "scalers.pkl"
 
     # ────────── Window & Scaling ──────────
-    window: int = 3                       
+    window: int = 4                       
     use_standard_scaler: bool = True
     save_scalers: bool = True  # ← Fixed: Added missing attribute
 
