@@ -19,11 +19,11 @@ class Config:
     save_scalers: bool = True  # ← Fixed: Added missing attribute
 
     # ────────── Training ──────────
-    batch_size: int = 16
+    batch_size: int = 32
     epochs: int = 300
-    lr: float = 5e-4
+    lr: float = 3e-3
     weight_decay: float = 5e-4
-    patience: int = 50             
+    patience: int = 30             
     
     # ────────── PINN / Multitask ──────────
     lambda_max: float = 0.5
@@ -35,9 +35,9 @@ class Config:
     hidden: int = 512
     k: int = 5
     alpha: float = 0.5
-    dropout: float = 0.15
+    dropout: float = 0.3
     att_hidden: int = 64
-    depth_edge: int = 4
+    depth_edge: int = 2
 
     # ────────── Experiment sweep ──────────
     seeds: List[int] = field(default_factory=lambda: [17])
