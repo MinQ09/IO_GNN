@@ -19,7 +19,7 @@ class Config:
     save_scalers: bool = True  # ← Fixed: Added missing attribute
 
     # ────────── Training ──────────
-    batch_size: int = 32
+    batch_size: int = 64
     epochs: int = 300
     lr: float = 3e-3
     weight_decay: float = 5e-4
