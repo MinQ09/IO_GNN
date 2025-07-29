@@ -103,8 +103,8 @@ def main():
         # 기본 설정으로 Config 생성
         base_config = Config(
             batch_size=64,  # 필수 필드에 기본값 제공
-            data_dir=Path("./Data"),
-            out_dir=Path("./Results/grid_search"),
+            data_dir=Path("/content/drive/MyDrive/IO_GNN/KR6/Data"),
+            out_dir=Path("/content/drive/MyDrive/IO_GNN/KR6/Results/grid_search"),
         )
     
     # 그리드 서치 활성화
