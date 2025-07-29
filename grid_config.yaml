@@ -4,7 +4,7 @@ out_dir: "/content/drive/MyDrive/IO_GNN/KR6/Results/grid_search"
 scalers_fname: "scalers.pkl"
 
 # 기본 설정
-window: 1
+window: 4
 use_standard_scaler: true
 save_scalers: true
 epochs: 50  # 그리드 서치용으로 줄임
