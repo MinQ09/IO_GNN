@@ -1,0 +1,40 @@
+# grid_config.yaml
+data_dir: "./Data"
+out_dir: "./Results/grid_search"
+scalers_fname: "scalers.pkl"
+
+# 기본 설정
+window: 1
+use_standard_scaler: true
+save_scalers: true
+epochs: 50  # 그리드 서치용으로 줄임
+patience: 15
+warmup: 25
+beta_x: 0.0
+beta_init: 0.1
+alpha: 0.5
+att_hidden: 64
+depth_edge: 2
+log_every: 5
+
+# 그리드 서치 활성화
+grid_search: true
+
+# 그리드 서치 파라미터 (128개 조합)
+batch_size_candidates: [32, 64]
+lr_candidates: [5e-5, 1e-4]
+weight_decay_candidates: [1e-5, 5e-5]
+hidden_candidates: [256, 512]
+k_candidates: [3, 5]
+dropout_candidates: [0.1, 0.3]
+lambda_candidates: [0, 0.5, 1.0]
+seeds: [95]
+
+# 기본값 (그리드 서치 시 무시됨)
+batch_size: 64
+lr: 5e-5
+weight_decay: 5e-5
+hidden: 512
+k: 5
+dropout: 0.3
+lambda_max: 0.5

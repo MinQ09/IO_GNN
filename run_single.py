@@ -78,7 +78,7 @@ def _adaptive_lambda(
     return (
         scale
         * cfg.lambda_max
-        * (mse.detach() / (pinn.detach() + 1e-12)).clamp(max=1.0)
+        * (mse.detach() / (pinn.detach() + 1e-12)).clamp(max=10.0)
     )
 
 
@@ -96,12 +96,12 @@ def run_single(
     edge_mode = kind == "Z"
 
     # ─── I/O dirs ──────────────────────────────────────────
-    save_dir = Path(cfg.out_dir) / f"seed_{seed}" / kind
+    save_dir = Path(cfg.out_dir) / f"seed_{seed}" / f"lam_{cfg.lambda_max:.4g}" / kind
     save_dir.mkdir(parents=True, exist_ok=True)
 
     # ─── DATASETS & SCALERS ───────────────────────────────
-    years = list(range(1, 21))  
-    tr_y, vl_y, ts_y = years[:-4], years[-4:-2], years[-2:]
+    years = list(range(1, 56))  
+    tr_y, vl_y, ts_y = years[:-10], years[-10:-5], years[-5:]
 
     tr_ds = GraphWindowDataset(tr_y, cfg, scalers=None, fit_scalers=True)
     scalers = tr_ds.get_scalers()
@@ -205,7 +205,7 @@ def run_single(
 
         tqdm.write(
             f"[EP {ep:03d}] train: loss {tot/nb:.4f} | MSE {mse_acc/nb:.4f} | "
-            f"PINN {pinn_acc/nb:.4f} | λ̄ {lam_avg:.3e} | R² {r2_acc/nb:.3f}"
+            f"PINN {pinn_acc/nb:.6f} | λ̄ {lam_avg:.3e} | R² {r2_acc/nb:.3f}"
         )
 
         # ─── VALIDATION ─────────────────────────────────
@@ -338,11 +338,17 @@ def run_single(
         save_x=False,
     )
 
-    torch.save(model.cpu().state_dict(), save_dir / "model.pth")
-    (save_dir / "alpha.txt").write_text(f"{model.cell.Ox.alpha.item():.6f}")
-    (save_dir / "val_history.json").write_text(
+    (save_dir / f"metrics_lambda_{cfg.lambda_max:.4g}.json").write_text(
+            json.dumps(metrics, indent=2))
+    
+    (save_dir / f"val_history_lambda_{cfg.lambda_max:.4g}.json").write_text(
         json.dumps({k: list(map(float, v)) for k, v in hist.items()}, indent=2)
     )
+
+    torch.save(model.cpu().state_dict(),
+               save_dir / f"model_lambda_{cfg.lambda_max:.4g}.pth")
+
+    (save_dir / "alpha.txt").write_text(f"{model.cell.Ox.alpha.item():.6f}")
 
     print("\n[Test]")
     for k, v in metrics.items():
