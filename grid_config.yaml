@@ -1,6 +1,6 @@
 # grid_config.yaml
-data_dir: "./Data"
-out_dir: "./Results/grid_search"
+data_dir: "/content/drive/MyDrive/IO_GNN/KR6/Data"
+out_dir: "/content/drive/MyDrive/IO_GNN/KR6/Results/grid_search"
 scalers_fname: "scalers.pkl"
 
 # 기본 설정
