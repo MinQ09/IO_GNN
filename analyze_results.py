@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from pathlib import Path
 
-def analyze_grid_results(csv_path: str = "/content/drive/MyDrive/IO_GNN/KR6/Results/grid_search/grid_search_results.csv"):
+def analyze_grid_results(csv_path: str = "./Results/grid_search/grid_search_results.csv"):
     """그리드 서치 결과 분석"""
     
     df = pd.read_csv(csv_path)
@@ -43,7 +43,7 @@ def analyze_grid_results(csv_path: str = "/content/drive/MyDrive/IO_GNN/KR6/Resu
             ax.set_xscale('log')
     
     plt.tight_layout()
-    plt.savefig('/content/drive/MyDrive/IO_GNN/KR6/Results/grid_search/parameter_analysis.png')
+    plt.savefig('./Results/grid_search/parameter_analysis.png')
     plt.show()
     
     # 3. Top configurations

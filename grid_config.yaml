@@ -1,13 +1,12 @@
-# grid_config.yaml
-data_dir: "/content/drive/MyDrive/IO_GNN/KR6/Data"
-out_dir: "/content/drive/MyDrive/IO_GNN/KR6/Results/grid_search"
+# grid_config.yaml ─────────────────────────────────────────
+data_dir: "./Data"
+out_dir: "./Results/grid_search/v3"
 scalers_fname: "scalers.pkl"
 
-# 기본 설정
-window: 4
-use_standard_scaler: true
+# ─────────── 공통 학습 설정 ───────────
+window: 1
 save_scalers: true
-epochs: 50  # 그리드 서치용으로 줄임
+epochs: 50          # 그리드 서치용 짧은 학습
 patience: 15
 warmup: 25
 beta_x: 0.0
@@ -17,20 +16,20 @@ att_hidden: 64
 depth_edge: 2
 log_every: 5
 
-# 그리드 서치 활성화
+# ─────────── 그리드 서치 활성화 ───────
 grid_search: true
 
-# 그리드 서치 파라미터 (128개 조합)
-batch_size_candidates: [32, 64]
-lr_candidates: [5e-5, 1e-4]
-weight_decay_candidates: [1e-5, 5e-5]
-hidden_candidates: [256, 512]
-k_candidates: [3, 5]
-dropout_candidates: [0.1, 0.3]
-lambda_candidates: [0, 0.5, 1.0]
+# ─────────── 그리드 축(최대 256 조합) ─
+batch_size_candidates:   [16, 32]
+lr_candidates:           [5e-6, 1e-5]
+weight_decay_candidates: [1e-5, 1e-4]
+hidden_candidates:       [256, 512]
+k_candidates:            [3, 5]
+dropout_candidates:      [0.15, 0.3]
+lambda_grid_candidates:  [0.0, 0.01]     #  ← 이름 변경
 seeds: [95]
 
-# 기본값 (그리드 서치 시 무시됨)
+# ─────────── 단일 실행 기본값 (grid 무시) ─
 batch_size: 64
 lr: 5e-5
 weight_decay: 5e-5
@@ -38,3 +37,4 @@ hidden: 512
 k: 5
 dropout: 0.3
 lambda_max: 0.5
+scale_targets: false

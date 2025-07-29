@@ -3,104 +3,73 @@ from torch import Tensor
 from torch_geometric.data import Data
 from typing import Any, Dict, Callable
 
-EPS = 1e-12                   # 수치 안전용
+EPS = 1e-12                 
 
-# ───────── Z PINN 3-in-1 ──────────────────────────────────
-def pinn_single_z_std(
-    z_std: Tensor,
+# --- util ----------------------------------------------------------
+def _rel_err(pred: Tensor, true: Tensor, eps: float = EPS) -> Tensor:
+    """|pred-true| / (|true|+eps)  – 크기 차이 완화용."""
+    return (pred - true).abs() / (true.abs() + eps)
+
+# --- Z PINN (raw-scale) -----------------------------------------------
+def pinn_single_z_raw(
+    z_raw: Tensor,
     g: Data,
-    scalers: Dict[str, Any],
     *,
     w_row: float = 1.0,
     w_col: float = 1.0,
-    w_net: float = 1.0,
 ) -> Tensor:
-    """
-    • row_res : ∑_j Z_ij + FD_i + EXP_i − TOT_i
-    • col_res : ∑_i Z_ij + VA_j + IMP_j − TOT_j
-    • net_res : row_res − col_res   (중복 상쇄)
-      → 세 잔차 모두 σ_tot 로 나눠 표준편차 1 스케일에 맞춤
-    """
-
     src, trg = g.edge_index
     n = g.num_nodes
 
-    # ── 집계(표준화 공간) ────────────────────────────────
-    row = torch.zeros(n, device=z_std.device).index_add_(0, src, z_std)
-    col = torch.zeros(n, device=z_std.device).index_add_(0, trg, z_std)
 
-    imp, exp, fd = g.x.T            # std-space
-    va_std       = g.va
-    tot_std      = g.tot
+    row = torch.zeros(n, device=z_raw.device).index_add_(0, src, z_raw)
+    col = torch.zeros(n, device=z_raw.device).index_add_(0, trg, z_raw)
 
-    # ── σ_tot (노드별 표준편차) 로 스케일 평준화 ──────────
-    σ_tot = torch.tensor(
-        scalers["node"]["total"].scale_,
-        device=tot_std.device,
-        dtype=tot_std.dtype,
-    ) + EPS                          # 안전 분모
+    SCALE = 1e6
+    imp_raw, exp_raw, fd_raw = g.x_raw.T / SCALE
 
-    row_res = (row + fd + exp  - tot_std)        
-    col_res = (col + va_std + imp - tot_std)      
-    net_res = row_res - col_res                             
+    row_res = _rel_err(row + fd_raw + exp_raw - imp_raw - g.tot, g.tot)   # Σrow = TOT
+    col_res = _rel_err(col + g.va - g.tot,             g.tot)   # Σcol = TOT
 
-    loss = (
-        w_row * row_res.abs().mean()
-        + w_col * col_res.abs().mean()
-    ) / 2
-    return loss
+    return w_row * row_res.mean() + w_col * col_res.mean()
 
-
-# ───────── VA PINN (열 합계) ────────────────────────────
-def pinn_single_va_std(
-    va_std: Tensor,
+# --- VA PINN (raw-scale) ----------------------------------------------
+def pinn_single_va_raw(
+    va_raw: Tensor,
     g: Data,
-    scalers: Dict[str, Any],
     *,
     w_col: float = 1.0,
 ) -> Tensor:
-    """
-    • col_res : ∑_i Z_ij + VA_j + IMP_j − TOT_j  (표준화 후 절댓값 평균)
-    """
     src, trg = g.edge_index
     n = g.num_nodes
 
-    col_true = torch.zeros(n, device=va_std.device).index_add_(0, trg, g.edge_attr)
-    imp      = g.x[:, 0]           # std-space
-    tot_std  = g.tot
+    col_z = torch.zeros(n, device=va_raw.device).index_add_(0, trg, g.edge_attr)
+    col_pred = col_z + va_raw
+    col_res  = _rel_err(col_pred, g.tot)     # Σ(Z + VA) = TOT
 
-    σ_tot = torch.tensor(
-        scalers["node"]["total"].scale_,
-        device=tot_std.device,
-        dtype=tot_std.dtype,
-    ) + EPS
+    return w_col * col_res.mean()
 
-    col_pred = col_true + va_std + imp
-    col_res  = (col_pred - tot_std)               # ★
-
-    return w_col * col_res.abs().mean()
-
-
-# ───────── batch wrappers (변경 없음) ────────────────────
-def pinn_loss_z_batch_standardized(z_cat, batch, scalers):
+# ───────── batch wrappers ────────────────────
+def pinn_loss_z_batch_raw(z_cat, batch):
     off, losses = 0, []
     for g in batch:
         e = g.edge_attr.numel()
-        losses.append(pinn_single_z_std(z_cat[off:off+e], g, scalers))
+        losses.append(pinn_single_z_raw(z_cat[off:off+e], g))
         off += e
     return torch.stack(losses).mean()
 
-def pinn_loss_va_batch_standardized(va_cat, batch, scalers):
+def pinn_loss_va_batch_raw(va_cat, batch):
     off, losses = 0, []
     for g in batch:
         n = g.num_nodes
-        losses.append(pinn_single_va_std(va_cat[off:off+n], g, scalers))
+        losses.append(pinn_single_va_raw(va_cat[off:off+n], g))
         off += n
     return torch.stack(losses).mean()
 
 def get_pinn_loss_function(kind: str) -> Callable:
     if kind == "Z":
-        return pinn_loss_z_batch_standardized
+        return pinn_loss_z_batch_raw
     if kind == "VA":
-        return pinn_loss_va_batch_standardized
+        return pinn_loss_va_batch_raw
     raise ValueError(kind)
+
