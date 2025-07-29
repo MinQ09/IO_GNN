@@ -14,8 +14,8 @@ class Config:
     batch_size: int = 32
 
     # ────────── Paths ──────────
-    data_dir: Path = Path("/Users/mingyu/Downloads/KR6/Data")
-    out_dir: Path  = Path("/Users/mingyu/Downloads/KR6/Results/V23")
+    data_dir: Path = Path("/content/drive/MyDrive/IO_GNN/KR6/Data")
+    out_dir: Path  = Path("/content/drive/MyDrive/IO_GNN/KR6/V10")
     scalers_fname: str = "scalers.pkl"
 
     # ────────── Window & Scaling ──────────
