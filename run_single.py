@@ -178,7 +178,7 @@ def run_single(cfg: Any, seed: int, *, kind: str = "Z"):
     save_dir.mkdir(parents=True, exist_ok=True)
 
     # train/val/test splits
-    tr_y, vl_y, ts_y = years[:-4], years[-4:-2], years[-2:]
+    tr_y, vl_y, ts_y = years[:-10], years[-10:-5], years[-5:]
     tr_ds = GraphWindowDataset(tr_y, cfg, scalers=None, fit_scalers=True, scale_targets=False)
     scalers = deepcopy(tr_ds.get_scalers())
     vl_ds = GraphWindowDataset(vl_y, cfg, scalers=scalers, fit_scalers=False, scale_targets=False)
