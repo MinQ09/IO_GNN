@@ -23,8 +23,8 @@ class Config:
     seeds: List[int] = field(default_factory=lambda: [19, 95, 123])
 
     # ─────────────────────────── Paths ──────────────────────────────────────
-    data_dir: Path = Path("./Data")
-    out_dir: Path = Path("./Results/V31")
+    data_dir: Path = Path("/content/drive/MyDrive/IO_GNN/KR6/Data")
+    out_dir: Path = Path(("/content/drive/MyDrive/IO_GNN/KR6/Results/V31")
     scalers_fname: str = "scalers.pkl"
 
     # ─────────────────────────── Scaling & window ───────────────────────────
