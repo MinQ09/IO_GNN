@@ -45,7 +45,7 @@ class Config:
     dropout: float = 0.3
     alpha: float = 0.5
     att_hidden: int = 64
-    depth_edge: int = 2
+    depth_edge: int = 3
 
     # ─────────────────────────── Sweep (non-grid) ──────────────────────────
     lambda_candidates: List[float] = field(default_factory=lambda: [0.0, 0.01])
