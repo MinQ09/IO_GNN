@@ -20,7 +20,7 @@ import pickle
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader
 from sklearn.model_selection import BaseCrossValidator
 from tqdm.auto import trange, tqdm
 from copy import deepcopy
@@ -239,7 +239,15 @@ def run_single(cfg: Any, seed: int, *, kind: str = "Z"):
         hist['train_pinn'].append(pinn_acc/len(tr_ld))
         hist['train_R2'].append(r2_acc/len(tr_ld))
         hist['lambda_t'].append(lam_avg)
-
+        if ep% cfg.log_every == 0 or ep == cfg.epochs:
+            tqdm.write(
+                f"[Train] Epoch {ep} - Loss: {tot/len(tr_ld):.4f}, "
+                f"MSE: {mse_acc/len(tr_ld):.4f}, "
+                f"PINN: {pinn_acc/len(tr_ld):.4f}, "
+                f"R²: {r2_acc/len(tr_ld):.4f}, "
+                f"Lambda: {lam_avg:.4f}"
+            )
+            
         # VALIDATION
         model.eval()
         v_tot = v_mse = v_pinn = 0.0
@@ -321,6 +329,19 @@ def run_single(cfg: Any, seed: int, *, kind: str = "Z"):
     metrics = {k.upper(): float(mean_ignore_nan(v)) for k, v in res.items()}
     if not edge_mode:
         metrics.pop("CVR", None)
+
+    if ep % cfg.log_every == 0 or ep == cfg.epochs:
+        msg = (
+            f"[VAL {ep:04d}] "
+            f"loss {v_tot/len(vl_ld):.4f} | "
+            f"RMSE {hist['val_RMSE'][-1]:.3f}  "
+            f"MAE {hist['val_MAE'][-1]:.3f}  "
+            f"SMAPE {hist['val_SMAPE'][-1]:.3f}  "
+            f"R² {hist['val_R2'][-1]:.3f}"
+        )
+        if edge_mode:
+            msg += f"  CVR {hist['val_CVR'][-1]:.2e}"
+        tqdm.write(msg)
 
     # Save artifacts
     scalers_path = save_dir / "scalers.pkl"

@@ -19,12 +19,12 @@ class Config:
     lr: float = 0.0001
     weight_decay: float = 0.00001
     epochs: int = 1000
-    patience: int = 300
-    seeds: List[int] = field(default_factory=lambda: [19, 95, 123])
+    patience: int = 1000
+    seeds: List[int] = field(default_factory=lambda: [95])
 
     # ─────────────────────────── Paths ──────────────────────────────────────
-    data_dir: Path = Path("/content/drive/MyDrive/IO_GNN/KR6/Data")
-    out_dir: Path = Path("/content/drive/MyDrive/IO_GNN/KR6/Results/V31")
+    data_dir: Path = Path("/Users/minq/Desktop/KR7/Data")
+    out_dir: Path = Path("/Users/minq/Desktop/KR7/Results/V3")
     scalers_fname: str = "scalers.pkl"
 
     # ─────────────────────────── Scaling & window ───────────────────────────

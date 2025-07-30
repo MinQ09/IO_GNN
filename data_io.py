@@ -46,8 +46,11 @@ def _protect_zero_variance(scaler: StandardScaler) -> None:
     scaler.scale_[scaler.scale_ == 0.0] = 1.0
 
 def _identity_scaler() -> StandardScaler:
-    s = StandardScaler(); s.fit(np.array([[0.0], [1.0]]))
-    _protect_zero_variance(s); return s
+    s = StandardScaler()
+    s.mean_  = np.zeros(1, dtype=np.float32)
+    s.scale_ = np.ones (1, dtype=np.float32)
+    s.var_   = np.ones (1, dtype=np.float32)
+    return s
 
 # single helper kept – all inverse transforms route here
 
@@ -108,8 +111,10 @@ def load_nodes(
             va_std = scalers["value_added"].transform(va_np)
             tot_std = scalers["total"].transform(tot_np)
     else:
-        scalers["value_added"] = _identity_scaler()
-        scalers["total"]       = _identity_scaler()
+        if scalers["value_added"] is None:
+            scalers["value_added"] = _identity_scaler()
+        if scalers["total"] is None:
+            scalers["total"] = _identity_scaler()
         va_std, tot_std = va_np, tot_np
 
     # tensors --------------------------------------------------------------------
@@ -201,6 +206,8 @@ class GraphWindowDataset(Dataset):
         self.window = cfg.window
         base = Path(cfg.data_dir)
         self.scalers = scalers or {"node": None, "edge_A": None, "edge_Z": None}
+        if self.scalers["edge_Z"] is None:
+            self.scalers["edge_Z"] = _identity_scaler()
         self.graphs_A: List[Data] = []
         self.graphs_Z: List[Data] = []
 
@@ -212,17 +219,17 @@ class GraphWindowDataset(Dataset):
                 edge_scaler=self.scalers["edge_A"],
                 fit_scalers=fit_scalers,
                 scale_node_feats=True,
-                scale_va_tot=False,
+                scale_va_tot=True,
                 apply_edge_scaler=False,
             )
-            g_Z, _, self.scalers["edge_Z"] = make_graph(
+            g_Z, _, _ = make_graph(
                 base / f"X_{y}.csv",
                 base / f"Zf_{y}.csv",
                 node_scalers=self.scalers["node"],
                 edge_scaler=self.scalers["edge_Z"],
-                fit_scalers=fit_scalers,
+                fit_scalers=False,
                 scale_node_feats=True,
-                scale_va_tot=False,
+                scale_va_tot= True,
                 apply_edge_scaler=True,
             )
             self.graphs_A.append(g_A)
