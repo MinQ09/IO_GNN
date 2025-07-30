@@ -150,6 +150,7 @@ class GraphWindowDataset(Dataset):
         scale_targets: bool = False,
     ):
         self.window = cfg.window
+        self.nfeat = len(NODE_COLS)
         base = Path(cfg.data_dir)
         self.scalers = scalers or {"node": None, "edge_A": None, "edge_Z": None}
         self.graphs_A, self.graphs_Z = [], []
