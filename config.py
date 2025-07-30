@@ -16,15 +16,15 @@ class Config:
 
     # ─────────────────────────── Base hyper-params ──────────────────────────
     batch_size: int = 32
-    lr: float = 0.0001
-    weight_decay: float = 0.00001
+    lr: float = 0.001
+    weight_decay: float = 0.0001
     epochs: int = 1000
-    patience: int = 1000
+    patience: int = 300
     seeds: List[int] = field(default_factory=lambda: [95])
 
     # ─────────────────────────── Paths ──────────────────────────────────────
-    data_dir: Path = Path("/Users/minq/Desktop/KR7/Data")
-    out_dir: Path = Path("/Users/minq/Desktop/KR7/Results/V3")
+    data_dir: Path = Path("./Data")
+    out_dir: Path = Path("./Results/V7")
     scalers_fname: str = "scalers.pkl"
 
     # ─────────────────────────── Scaling & window ───────────────────────────
@@ -43,7 +43,7 @@ class Config:
 
     # ─────────────────────────── PINN / multi-task ─────────────────────────
     lambda_max: float = 0.5
-    warmup: int = 100
+    warmup: int = 10
     beta_x: float = 0.0
     beta_init: float = 0.1
 
@@ -56,7 +56,7 @@ class Config:
     depth_edge: int = 3
 
     # ─────────────────────────── Sweep (non-grid) ──────────────────────────
-    lambda_candidates: List[float] = field(default_factory=lambda: [0.0, 0.01])
+    lambda_candidates: List[float] = field(default_factory=lambda: [0.0, 0.01, 0.1])
     beta_candidates:   List[float] = field(default_factory=lambda: [0.0])
 
     # ─────────────────────────── Grid-search flags ─────────────────────────

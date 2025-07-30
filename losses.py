@@ -3,14 +3,12 @@ from torch import Tensor
 from torch_geometric.data import Data
 from typing import Any, Dict, Callable
 
-EPS = 1e-12                 
+EPS = 1e-12
 
-# --- util ----------------------------------------------------------
-def _rel_err(pred: Tensor, true: Tensor, eps: float = EPS) -> Tensor:
-    """|pred-true| / (|true|+eps)  – 크기 차이 완화용."""
-    return (pred - true).abs() / (true.abs() + eps)
+def _rel_err(residual: Tensor, scale: Tensor, eps: float = EPS) -> Tensor:
+    """|residual| / (|scale|+eps) - scale은 g.tot 같이 항상 양수인 기준."""
+    return residual.abs() / (scale.abs() + eps)
 
-# --- Z PINN (raw-scale) -----------------------------------------------
 def pinn_single_z_raw(
     z_raw: Tensor,
     g: Data,
@@ -21,19 +19,24 @@ def pinn_single_z_raw(
     src, trg = g.edge_index
     n = g.num_nodes
 
-
     row = torch.zeros(n, device=z_raw.device).index_add_(0, src, z_raw)
     col = torch.zeros(n, device=z_raw.device).index_add_(0, trg, z_raw)
 
     SCALE = 1e6
     imp_raw, exp_raw, fd_raw = g.x_raw.T / SCALE
 
-    row_res = _rel_err(row + fd_raw + exp_raw - imp_raw - g.tot, g.tot)   # Σrow = TOT
-    col_res = _rel_err(col + g.va - g.tot,             g.tot)   # Σcol = TOT
+    # ✅ 올바른 잔차 정의 (= 0이어야 하는 값)
+    row_imb = row + fd_raw + exp_raw - imp_raw - g.tot
+    col_imb = col + g.va - g.tot
+    net = row + fd_raw + exp_raw - imp_raw - col - g.va
 
-    return w_row * row_res.mean() + w_col * col_res.mean()
+    row_res = _rel_err(row_imb, g.tot)
+    col_res = _rel_err(col_imb, g.tot)
+    net_res = _rel_err(net, g.tot)
 
-# --- VA PINN (raw-scale) ----------------------------------------------
+    # ✅ 올바른 합산 방식
+    return net_res.abs().mean()
+
 def pinn_single_va_raw(
     va_raw: Tensor,
     g: Data,
@@ -44,12 +47,12 @@ def pinn_single_va_raw(
     n = g.num_nodes
 
     col_z = torch.zeros(n, device=va_raw.device).index_add_(0, trg, g.edge_attr)
-    col_pred = col_z + va_raw
-    col_res  = _rel_err(col_pred, g.tot)     # Σ(Z + VA) = TOT
+    col_imb = col_z + va_raw - g.tot  # ✅ 올바른 잔차
 
+    col_res = _rel_err(col_imb, g.tot)
     return w_col * col_res.mean()
 
-# ───────── batch wrappers ────────────────────
+# 배치 래퍼는 그대로
 def pinn_loss_z_batch_raw(z_cat, batch):
     off, losses = 0, []
     for g in batch:
@@ -65,6 +68,7 @@ def pinn_loss_va_batch_raw(va_cat, batch):
         losses.append(pinn_single_va_raw(va_cat[off:off+n], g))
         off += n
     return torch.stack(losses).mean()
+
 
 def get_pinn_loss_function(kind: str) -> Callable:
     if kind == "Z":

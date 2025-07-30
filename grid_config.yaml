@@ -20,13 +20,13 @@ log_every: 5
 grid_search: true
 
 # ─────────── 그리드 축(최대 256 조합) ─
-batch_size_candidates:   [16, 32]
-lr_candidates:           [5e-6, 1e-5]
+batch_size_candidates:   [32]
+lr_candidates:           [5e-6,5e-5, 1e-5]
 weight_decay_candidates: [1e-5, 1e-4]
-hidden_candidates:       [256, 512]
+hidden_candidates:       [512]
 k_candidates:            [3, 5]
 dropout_candidates:      [0.15, 0.3]
-lambda_grid_candidates:  [0.0, 0.01]     #  ← 이름 변경
+lambda_grid_candidates:  [0.0, 0.01, 0.1]     #  ← 이름 변경
 seeds: [95]
 
 # ─────────── 단일 실행 기본값 (grid 무시) ─

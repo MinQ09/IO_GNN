@@ -233,20 +233,16 @@ def run_single(cfg: Any, seed: int, *, kind: str = "Z"):
             tot += loss.item(); mse_acc += mse.item(); pinn_acc += pinn.item()
             r2_acc += r2(pred_o, tgt_o); lam_acc += lam_t.item(); global_step += 1
 
-        lam_avg = lam_acc / len(tr_ld)
-        hist['train_tot'].append(tot/len(tr_ld))
-        hist['train_mse'].append(mse_acc/len(tr_ld))
-        hist['train_pinn'].append(pinn_acc/len(tr_ld))
-        hist['train_R2'].append(r2_acc/len(tr_ld))
+        nb = len(tr_ld)
+        lam_avg = lam_acc / nb
+        hist['train_tot'].append(tot/nb)
+        hist['train_mse'].append(mse_acc/nb)
+        hist['train_pinn'].append(pinn_acc/nb)
+        hist['train_R2'].append(r2_acc/nb)
         hist['lambda_t'].append(lam_avg)
-        if ep% cfg.log_every == 0 or ep == cfg.epochs:
-            tqdm.write(
-                f"[Train] Epoch {ep} - Loss: {tot/len(tr_ld):.4f}, "
-                f"MSE: {mse_acc/len(tr_ld):.4f}, "
-                f"PINN: {pinn_acc/len(tr_ld):.4f}, "
-                f"R²: {r2_acc/len(tr_ld):.4f}, "
-                f"Lambda: {lam_avg:.4f}"
-            )
+
+        tqdm.write(f"[EP {ep:03d}] train: loss {tot/nb:.4f} | MSE {mse_acc/nb:.4f} | "
+                f"PINN {pinn_acc/nb:.4f} | λ̄ {lam_avg:.3e} | R² {r2_acc/nb:.3f}")
             
         # VALIDATION
         model.eval()
@@ -288,6 +284,21 @@ def run_single(cfg: Any, seed: int, *, kind: str = "Z"):
         hist["val_RHO"].append(mean_ignore_nan(acc["RHO"]))
         hist["val_CVR"].append(mean_ignore_nan(acc["cvr"]) if edge_mode else np.nan)
 
+        # Validation 로그 출력 (10번째마다) - ✅ 여기가 새로 추가된 부분
+        if ep % cfg.log_every == 0:
+            msg = (
+                f"[VAL {ep:03d}] "
+                f"loss {v_tot/len(vl_ld):.4f} | "
+                f"RMSE {hist['val_RMSE'][-1]:.3f} | "
+                f"MAE {hist['val_MAE'][-1]:.3f} | "
+                f"SMAPE {hist['val_SMAPE'][-1]:.3f} | "
+                f"R² {hist['val_R2'][-1]:.3f}"
+            )
+            if edge_mode:
+                msg += f" | CVR {hist['val_CVR'][-1]:.2e}"
+            tqdm.write(msg)
+
+        # Early stopping
         monitor = hist["val_SMAPE"][-1] if edge_mode else hist["val_MAE"][-1]
         if monitor < best_metric - 1e-8:
             best_metric = monitor
@@ -330,18 +341,10 @@ def run_single(cfg: Any, seed: int, *, kind: str = "Z"):
     if not edge_mode:
         metrics.pop("CVR", None)
 
-    if ep % cfg.log_every == 0 or ep == cfg.epochs:
-        msg = (
-            f"[VAL {ep:04d}] "
-            f"loss {v_tot/len(vl_ld):.4f} | "
-            f"RMSE {hist['val_RMSE'][-1]:.3f}  "
-            f"MAE {hist['val_MAE'][-1]:.3f}  "
-            f"SMAPE {hist['val_SMAPE'][-1]:.3f}  "
-            f"R² {hist['val_R2'][-1]:.3f}"
-        )
-        if edge_mode:
-            msg += f"  CVR {hist['val_CVR'][-1]:.2e}"
-        tqdm.write(msg)
+    # ❌ 이 부분은 삭제 (중복된 validation 로그)
+    # if ep % cfg.log_every == 0:
+    #     msg = (...)
+    #     tqdm.write(msg)
 
     # Save artifacts
     scalers_path = save_dir / "scalers.pkl"
