@@ -24,7 +24,7 @@ class Config:
 
     # ─────────────────────────── Paths ──────────────────────────────────────
     data_dir: Path = Path("/content/drive/MyDrive/IO_GNN/KR6/Data")
-    out_dir: Path = Path(("/content/drive/MyDrive/IO_GNN/KR6/Results/V31")
+    out_dir: Path = Path("/content/drive/MyDrive/IO_GNN/KR6/Results/V31")
     scalers_fname: str = "scalers.pkl"
 
     # ─────────────────────────── Scaling & window ───────────────────────────
@@ -32,6 +32,14 @@ class Config:
     scale_node_feats: bool = True
     scale_targets: bool = False        # ← single-run default
     save_scalers: bool = True
+    
+    # ───────── Rolling-Window CV ─────────
+    rolling_val: bool = False
+    rolling_splits: int = 5
+    rolling_train_size: int | None = None
+    rolling_test_size: int = 1
+    rolling_gap: int = 0
+    fold_epochs: int = 5
 
     # ─────────────────────────── PINN / multi-task ─────────────────────────
     lambda_max: float = 0.5
