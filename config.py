@@ -18,9 +18,9 @@ class Config:
     batch_size: int = 32
     lr: float = 0.005
     weight_decay: float = 0.0001
-    epochs: int = 1000
-    patience: int = 500
-    seeds: List[int] = field(default_factory=lambda: [95])
+    epochs: int = 500
+    patience: int = 300
+    seeds: List[int] = field(default_factory=lambda: [19,95,123])
 
     # ─────────────────────────── Paths ──────────────────────────────────────
     data_dir: Path = Path("./Data")
