@@ -1,3 +1,5 @@
+# experiment.py  ──────────────────────────────────────────────────────────────
+
 """experiment.py – master driver for IO‑GNN experiments
 ------------------------------------------------------
 Runs one or both tasks:
@@ -12,6 +14,7 @@ Output layout
 <out_dir>/<kind>/seed_<s>/   (created inside run_single)
 <out_dir>/summary_<kind>.json – per‑kind cross‑seed metrics
 """
+
 from __future__ import annotations
 
 import argparse
@@ -27,7 +30,7 @@ from utils import set_seed
 from run_single import run_single
 
 # ----------------------------------------------------------------------
-Metrics: List[str] = ["RMSE", "MAE", "SMAPE", "R2", "RHO"]
+Metrics: List[str] = ["RMSE", "MAE", "SMAPE", "R2", "RHO", "CVR"]  
 
 # ----------------------------------------------------------------------
 def run_all(cfg: Config, kinds: List[str]) -> None:
@@ -51,7 +54,6 @@ def run_all(cfg: Config, kinds: List[str]) -> None:
 
         for lam in cfg.lambda_candidates:
             for beta in cfg.beta_candidates:
-                # make a shallow copy so we can tweak λ, β
                 exp_cfg = copy.deepcopy(cfg)
                 exp_cfg.lambda_max = lam
                 exp_cfg.beta_init  = beta
@@ -59,7 +61,12 @@ def run_all(cfg: Config, kinds: List[str]) -> None:
                 for kind in kinds:
                     _, _, _, metrics = run_single(exp_cfg, seed=seed, kind=kind)
                     for m in Metrics:
-                        summary[kind][(lam, beta)][m].append(metrics[m])
+                        # CVR은 Z 모델에만 있으므로 안전하게 처리
+                        if m in metrics:
+                            summary[kind][(lam, beta)][m].append(metrics[m])
+                        else:
+                            # VA 모델에서 CVR이 없는 경우 NaN 추가
+                            summary[kind][(lam, beta)][m].append(float('nan'))
 
     # write summaries ─────────────────────────────────────────────────
     for kind in kinds:
@@ -70,9 +77,14 @@ def run_all(cfg: Config, kinds: List[str]) -> None:
             stats = {}
             for m in Metrics:
                 arr = np.asarray(vals[m], dtype=float)
-                mu  = float(arr.mean())
-                sd  = float(arr.std(ddof=1)) if len(arr) > 1 else 0.0
-                print(f"λ={lam:g}, β={beta:g}  {m:<6}: {mu:.4f} ± {sd:.4f}")
+                # NaN 값들을 필터링 (VA 모델의 CVR 등)
+                valid_arr = arr[~np.isnan(arr)]
+                if len(valid_arr) > 0:
+                    mu = float(valid_arr.mean())
+                    sd = float(valid_arr.std(ddof=1)) if len(valid_arr) > 1 else 0.0
+                    print(f"λ={lam:g}, β={beta:g}  {m:<6}: {mu:.4f} ± {sd:.4f}")
+                else:
+                    print(f"λ={lam:g}, β={beta:g}  {m:<6}: N/A")
                 stats[m] = vals[m]  # raw list for JSON
             serial[tag] = stats
 
@@ -88,6 +100,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     cfg = Config()
+
     if args.out_dir:
         cfg.out_dir = args.out_dir
 

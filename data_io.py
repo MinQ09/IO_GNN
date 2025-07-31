@@ -86,7 +86,7 @@ def load_nodes(
         }
 
     # raw numpy arrays ------------------------------------------------------------
-    x_np   = df[list(NODE_COLS)].values
+    x_np   = df[list(NODE_COLS)].values / SCALE_FACTOR
     va_np  = df["Value_Added"].values.reshape(-1, 1) / SCALE_FACTOR
     tot_np = df["Total"      ].values.reshape(-1, 1) / SCALE_FACTOR
 

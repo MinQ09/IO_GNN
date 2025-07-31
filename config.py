@@ -16,15 +16,15 @@ class Config:
 
     # ─────────────────────────── Base hyper-params ──────────────────────────
     batch_size: int = 32
-    lr: float = 0.001
+    lr: float = 0.005
     weight_decay: float = 0.0001
     epochs: int = 1000
-    patience: int = 300
+    patience: int = 500
     seeds: List[int] = field(default_factory=lambda: [95])
 
     # ─────────────────────────── Paths ──────────────────────────────────────
     data_dir: Path = Path("./Data")
-    out_dir: Path = Path("./Results/V7")
+    out_dir: Path = Path("./Results/V10")
     scalers_fname: str = "scalers.pkl"
 
     # ─────────────────────────── Scaling & window ───────────────────────────
@@ -50,13 +50,13 @@ class Config:
     # ─────────────────────────── Model structure ───────────────────────────
     hidden: int = 512
     k: int = 3
-    dropout: float = 0.3
+    dropout: float = 0.2
     alpha: float = 0.5
     att_hidden: int = 64
     depth_edge: int = 3
 
     # ─────────────────────────── Sweep (non-grid) ──────────────────────────
-    lambda_candidates: List[float] = field(default_factory=lambda: [0.0, 0.01, 0.1])
+    lambda_candidates: List[float] = field(default_factory=lambda: [0, 0.01, 0.1])
     beta_candidates:   List[float] = field(default_factory=lambda: [0.0])
 
     # ─────────────────────────── Grid-search flags ─────────────────────────

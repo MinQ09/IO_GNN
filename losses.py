@@ -22,8 +22,7 @@ def pinn_single_z_raw(
     row = torch.zeros(n, device=z_raw.device).index_add_(0, src, z_raw)
     col = torch.zeros(n, device=z_raw.device).index_add_(0, trg, z_raw)
 
-    SCALE = 1e6
-    imp_raw, exp_raw, fd_raw = g.x_raw.T / SCALE
+    imp_raw, exp_raw, fd_raw = g.x_raw.T
 
     # ✅ 올바른 잔차 정의 (= 0이어야 하는 값)
     row_imb = row + fd_raw + exp_raw - imp_raw - g.tot

@@ -48,9 +48,14 @@ def _slice_batch(cat: torch.Tensor, graphs: List[pyg.data.Data], edge: bool):
         yield cat[offs:offs+span], g
         offs += span
 
-def _adaptive_lambda(*, mse: torch.Tensor, pinn: torch.Tensor, cfg, global_step: int) -> torch.Tensor:
-    scale = 1.0 if cfg.warmup == 0 else min(1.0, float(global_step) / cfg.warmup)
-    return scale * cfg.lambda_max * (mse.detach() / (pinn.detach() + 1e-12)).clamp(max=10.0)
+def _adaptive_lambda(
+    *, mse: torch.Tensor, pinn: torch.Tensor,
+    cfg, global_step: int
+) -> torch.Tensor:
+    warm = 1.0 if cfg.warmup == 0 else min(1.0, global_step / cfg.warmup)
+    ratio = torch.sqrt(mse.detach() / (pinn.detach() + 1e-12))
+    ratio = ratio.clamp(min=0.1, max=10.0)
+    return warm * cfg.lambda_max * ratio
 
 def is_identity_scaler(scaler):
     return (hasattr(scaler, 'scale_') and hasattr(scaler, 'mean_')
@@ -178,7 +183,7 @@ def run_single(cfg: Any, seed: int, *, kind: str = "Z"):
     save_dir.mkdir(parents=True, exist_ok=True)
 
     # train/val/test splits
-    tr_y, vl_y, ts_y = years[:-10], years[-10:-5], years[-5:]
+    tr_y, vl_y, ts_y = years[:-4], years[-4:-2], years[-2:]
     tr_ds = GraphWindowDataset(tr_y, cfg, scalers=None, fit_scalers=True, scale_targets=False)
     scalers = deepcopy(tr_ds.get_scalers())
     vl_ds = GraphWindowDataset(vl_y, cfg, scalers=scalers, fit_scalers=False, scale_targets=False)
@@ -284,7 +289,6 @@ def run_single(cfg: Any, seed: int, *, kind: str = "Z"):
         hist["val_RHO"].append(mean_ignore_nan(acc["RHO"]))
         hist["val_CVR"].append(mean_ignore_nan(acc["cvr"]) if edge_mode else np.nan)
 
-        # Validation 로그 출력 (10번째마다) - ✅ 여기가 새로 추가된 부분
         if ep % cfg.log_every == 0:
             msg = (
                 f"[VAL {ep:03d}] "
@@ -340,11 +344,6 @@ def run_single(cfg: Any, seed: int, *, kind: str = "Z"):
     metrics = {k.upper(): float(mean_ignore_nan(v)) for k, v in res.items()}
     if not edge_mode:
         metrics.pop("CVR", None)
-
-    # ❌ 이 부분은 삭제 (중복된 validation 로그)
-    # if ep % cfg.log_every == 0:
-    #     msg = (...)
-    #     tqdm.write(msg)
 
     # Save artifacts
     scalers_path = save_dir / "scalers.pkl"
