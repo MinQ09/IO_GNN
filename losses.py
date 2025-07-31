@@ -48,9 +48,9 @@ def pinn_single_va_raw(
     n = g.num_nodes
 
     col_z = torch.zeros(n, device=va_raw.device).index_add_(0, trg, g.edge_attr)
-    col_imb = col_z + va_raw - g.tot  # ✅ 올바른 잔차
+    col_imb = col_z + va_raw - g.tot_raw  # ✅ 올바른 잔차
 
-    col_res = _rel_err(col_imb, g.tot)
+    col_res = _rel_err(col_imb, g.tot_raw)
     return w_col * col_res.mean()
 
 # 배치 래퍼는 그대로
