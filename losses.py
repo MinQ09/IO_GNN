@@ -34,7 +34,7 @@ def pinn_single_z_raw(
     net_res = _rel_err(net, g.tot)
 
     # ✅ 올바른 합산 방식
-    return (w_row * row_res.mean() + w_col * col_res.mean())
+    return (w_row * row_res.mean() + w_col * col_res.mean())/2
 
 def pinn_single_va_raw(
     va_raw: Tensor,
