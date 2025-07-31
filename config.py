@@ -19,7 +19,7 @@ class Config:
     lr: float = 0.005
     weight_decay: float = 0.0001
     epochs: int = 1000
-    patience: int = 300
+    patience: int = 500
     seeds: List[int] = field(default_factory=lambda: [95])
 
     # ─────────────────────────── Paths ──────────────────────────────────────

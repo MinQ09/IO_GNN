@@ -122,7 +122,9 @@ def load_nodes(
     x_raw = torch.from_numpy(x_np ).float()
     va    = torch.from_numpy(va_std.squeeze()).float()
     tot   = torch.from_numpy(tot_std.squeeze()).float()
-    return x, x_raw, va, tot, scalers
+    va_raw = torch.from_numpy(va_np.squeeze()).float()
+    tot_raw = torch.from_numpy(tot_np.squeeze()).float()
+    return x, x_raw, va, tot, va_raw, tot_raw, scalers
 
 # ----------------------------------------------------------------------
 # edge table loader
@@ -173,7 +175,7 @@ def make_graph(
     scale_va_tot: bool = False,
     apply_edge_scaler: bool = True,
 ) -> Tuple[Data, Dict[str, StandardScaler], StandardScaler]:
-    x, x_raw, va, tot, node_scalers = load_nodes(
+    x, x_raw, va, tot, va_raw, tot_raw, node_scalers = load_nodes(
         x_csv,
         node_scalers,
         fit=fit_scalers,
@@ -186,7 +188,7 @@ def make_graph(
         apply_scaler=apply_edge_scaler,
         ensure_symmetric=False,
     )
-    return Data(x=x, x_raw=x_raw, edge_index=ei, edge_attr=ew, va=va, tot=tot), node_scalers, edge_scaler
+    return Data(x=x, x_raw=x_raw, edge_index=ei, edge_attr=ew, va=va, tot=tot, va_raw=va_raw, tot_raw=tot_raw), node_scalers, edge_scaler
 
 # ----------------------------------------------------------------------
 # dataset
