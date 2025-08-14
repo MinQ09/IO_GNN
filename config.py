@@ -16,15 +16,15 @@ class Config:
 
     # ─────────────────────────── Base hyper-params ──────────────────────────
     batch_size: int = 32
-    lr: float = 0.001
+    lr: float = 0.005
     weight_decay: float = 0.0001
-    epochs: int = 1000
+    epochs: int = 500
     patience: int = 500
-    seeds: List[int] = field(default_factory=lambda: [19,95,123])
+    seeds: List[int] = field(default_factory=lambda: [123])
 
     # ─────────────────────────── Paths ──────────────────────────────────────
     data_dir: Path = Path("./Data")
-    out_dir: Path = Path("./Results/V10")
+    out_dir: Path = Path("./Results/V43")
     scalers_fname: str = "scalers.pkl"
 
     # ─────────────────────────── Scaling & window ───────────────────────────
@@ -43,7 +43,7 @@ class Config:
 
     # ─────────────────────────── PINN / multi-task ─────────────────────────
     lambda_max: float = 0.5
-    warmup: int = 10
+    warmup: int = 20
     beta_x: float = 0.0
     beta_init: float = 0.1
 
@@ -56,7 +56,7 @@ class Config:
     depth_edge: int = 3
 
     # ─────────────────────────── Sweep (non-grid) ──────────────────────────
-    lambda_candidates: List[float] = field(default_factory=lambda: [0, 0.001, 0.005, 0.001])
+    lambda_candidates: List[float] = field(default_factory=lambda: [0,1])
     beta_candidates:   List[float] = field(default_factory=lambda: [0.0])
 
     # ─────────────────────────── Grid-search flags ─────────────────────────
@@ -136,13 +136,12 @@ class Config:
             scale_tg,
             seed,
         ) in enumerate(combos):
-            # deepcopy → 원본 오염 방지
             cfg_dict = deepcopy(asdict(self))
 
             # mutate with grid values
             cfg_dict.update(
                 dict(
-                    grid_search=False,           # 재귀 방지
+                    grid_search=False,         
                     batch_size=bs,
                     lr=lr,
                     weight_decay=wd,
@@ -160,7 +159,6 @@ class Config:
             cfg_dict["data_dir"] = Path(cfg_dict["data_dir"])
             cfg_dict["out_dir"]  = Path(cfg_dict["out_dir"])
 
-            # device는 init 시 자동 재설정 → 넘기지 않는다
             cfg_dict.pop("device", None)
             configs.append(Config(**cfg_dict))
 

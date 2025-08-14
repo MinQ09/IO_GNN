@@ -1,18 +1,18 @@
 # experiment.py  ──────────────────────────────────────────────────────────────
+"""
+Master driver for IO-GNN experiments.
 
-"""experiment.py – master driver for IO‑GNN experiments
-------------------------------------------------------
 Runs one or both tasks:
-    * kind="Z"  – edge‑flow prediction
-    * kind="VA" – node value‑added prediction
+  * kind="Z"  – edge-flow prediction
+  * kind="VA" – node value-added prediction
 
 Grid:
-    seeds × lambda_candidates × beta_candidates
+  seeds × lambda_candidates × beta_candidates
 
 Output layout
 -------------
-<out_dir>/<kind>/seed_<s>/   (created inside run_single)
-<out_dir>/summary_<kind>.json – per‑kind cross‑seed metrics
+<out_dir>/<kind>/seed_<s>/         (created inside run_single)
+<out_dir>/summary_<kind>.json      per-kind, cross-seed metrics
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ import argparse
 import copy
 import json
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import numpy as np
 
@@ -29,17 +29,17 @@ from config import Config
 from utils import set_seed
 from run_single import run_single
 
-# ----------------------------------------------------------------------
-Metrics: List[str] = ["RMSE", "MAE", "SMAPE", "R2", "RHO", "CVR"]  
+# Metrics collected from `run_single`. Note: IOIS is Z-only; for VA it will be NaN.
+Metrics: List[str] = ["RMSE", "MAE", "SMAPE", "R2", "RHO", "IOIS"]
 
-# ----------------------------------------------------------------------
+
 def run_all(cfg: Config, kinds: List[str]) -> None:
     """Launch the full sweep and write summary JSON files."""
     out_root = Path(cfg.out_dir)
     out_root.mkdir(parents=True, exist_ok=True)
 
-    # summary[kind][(λ,β)][metric] -> list[float]
-    summary: Dict[str, Dict[tuple[float, float], Dict[str, List[float]]]] = {
+    # summary[kind][(lambda, beta)][metric] -> list[float across seeds]
+    summary: Dict[str, Dict[Tuple[float, float], Dict[str, List[float]]]] = {
         k: {
             (lam, beta): {m: [] for m in Metrics}
             for lam in cfg.lambda_candidates
@@ -48,7 +48,7 @@ def run_all(cfg: Config, kinds: List[str]) -> None:
         for k in kinds
     }
 
-    # sweep ────────────────────────────────────────────────────────────
+    # ────────────────────────────────────────────────────────────────── sweep
     for seed in cfg.seeds:
         set_seed(seed)
 
@@ -56,19 +56,15 @@ def run_all(cfg: Config, kinds: List[str]) -> None:
             for beta in cfg.beta_candidates:
                 exp_cfg = copy.deepcopy(cfg)
                 exp_cfg.lambda_max = lam
-                exp_cfg.beta_init  = beta
+                exp_cfg.beta_init = beta
 
                 for kind in kinds:
                     _, _, _, metrics = run_single(exp_cfg, seed=seed, kind=kind)
                     for m in Metrics:
-                        # CVR은 Z 모델에만 있으므로 안전하게 처리
-                        if m in metrics:
-                            summary[kind][(lam, beta)][m].append(metrics[m])
-                        else:
-                            # VA 모델에서 CVR이 없는 경우 NaN 추가
-                            summary[kind][(lam, beta)][m].append(float('nan'))
+                        # IOIS is absent for VA; append NaN in that case
+                        summary[kind][(lam, beta)][m].append(metrics.get(m, float("nan")))
 
-    # write summaries ─────────────────────────────────────────────────
+    # ───────────────────────────────────────────────────────────── write summaries
     for kind in kinds:
         print(f"\n=== {kind} summary across seeds ===")
         serial = {}
@@ -77,15 +73,15 @@ def run_all(cfg: Config, kinds: List[str]) -> None:
             stats = {}
             for m in Metrics:
                 arr = np.asarray(vals[m], dtype=float)
-                # NaN 값들을 필터링 (VA 모델의 CVR 등)
-                valid_arr = arr[~np.isnan(arr)]
-                if len(valid_arr) > 0:
-                    mu = float(valid_arr.mean())
-                    sd = float(valid_arr.std(ddof=1)) if len(valid_arr) > 1 else 0.0
+                valid = arr[~np.isnan(arr)]
+                if valid.size > 0:
+                    mu = float(valid.mean())
+                    sd = float(valid.std(ddof=1)) if valid.size > 1 else 0.0
                     print(f"λ={lam:g}, β={beta:g}  {m:<6}: {mu:.4f} ± {sd:.4f}")
                 else:
                     print(f"λ={lam:g}, β={beta:g}  {m:<6}: N/A")
-                stats[m] = vals[m]  # raw list for JSON
+                # store raw values (keep NaNs) for downstream processing
+                stats[m] = [None if np.isnan(x) else float(x) for x in arr]
             serial[tag] = stats
 
         (out_root / f"summary_{kind}.json").write_text(json.dumps(serial, indent=2))
@@ -93,15 +89,14 @@ def run_all(cfg: Config, kinds: List[str]) -> None:
 
 # ----------------------------------------------------------------------
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="IO‑GNN experiment runner")
+    parser = argparse.ArgumentParser(description="IO-GNN experiment runner")
     parser.add_argument("--kinds", nargs="+", default=["Z", "VA"],
-                        help="Which models to train (Z VA)")
+                        help="Which models to train (choices include 'Z' and 'VA')")
     parser.add_argument("--out_dir", type=str, help="Override cfg.out_dir")
     args = parser.parse_args()
 
     cfg = Config()
-
     if args.out_dir:
-        cfg.out_dir = args.out_dir
+        cfg.out_dir = Path(args.out_dir)
 
     run_all(cfg, kinds=args.kinds)

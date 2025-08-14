@@ -1,17 +1,4 @@
 # data_io.py ──────────────────────────────────────────────────────────────
-"""IO-GNN data loading & scaling utilities.
-
-Key clean-ups vs V3:
-1. **scale_va_tot** flag now really scales VA / Total via a StandardScaler when
-   requested (default = False).
-2. **get_scalers()** returns a *deep* copy to avoid inadvertent mutation.
-3. Simpler & safer *ensure_symmetric* edge construction.
-4. Expose **nfeat** on `GraphWindowDataset` (== len(NODE_COLS)).
-5. `load_edges` returns the *actual* scaler used (identity by default) so the
-   caller can decide what to keep.
-6. De-duplicated inverse-transform helpers – keep only `_inverse_1d()` that both
-   high-level helpers call.
-"""
 
 from __future__ import annotations
 
