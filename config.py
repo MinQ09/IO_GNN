@@ -56,7 +56,7 @@ class Config:
     depth_edge: int = 3
 
     # ─────────────────────────── Sweep (non-grid) ──────────────────────────
-    lambda_candidates: List[float] = field(default_factory=lambda: [0,0.05,0.1])
+    lambda_candidates: List[float] = field(default_factory=lambda: [0,0.05])
     beta_candidates:   List[float] = field(default_factory=lambda: [0.0])
 
     # ─────────────────────────── Grid-search flags ─────────────────────────
