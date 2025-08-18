@@ -168,7 +168,7 @@ def run_single(cfg: Any, seed: int, *, kind: str = "Z"):
     model_cls = IOGNN_Z if edge_mode else IOGNN_VA
 
     # Use a simple sequential list as "years" to demo splits; replace with real indices if needed
-    years = list(range(1, 21))
+    years = list(range(1, 67))
 
     # Optional rolling-window CV branch
     if getattr(cfg, 'rolling_val', False):
@@ -193,7 +193,7 @@ def run_single(cfg: Any, seed: int, *, kind: str = "Z"):
     save_dir.mkdir(parents=True, exist_ok=True)
 
     # Splits
-    tr_y, vl_y, ts_y = years[:-4], years[-4:-2], years[-2:]
+    tr_y, vl_y, ts_y = years[:-12], years[-12:-6], years[-6:]
     tr_ds = GraphWindowDataset(tr_y, cfg, scalers=None, fit_scalers=True, scale_targets=False)
     scalers = deepcopy(tr_ds.get_scalers())
     vl_ds = GraphWindowDataset(vl_y, cfg, scalers=scalers, fit_scalers=False, scale_targets=False)
