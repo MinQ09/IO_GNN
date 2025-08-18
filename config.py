@@ -28,7 +28,7 @@ class Config:
     scalers_fname: str = "scalers.pkl"
 
     # ─────────────────────────── Scaling & window ───────────────────────────
-    window: int = 1
+    window: int = 5
     scale_node_feats: bool = True
     scale_targets: bool = False        # ← single-run default
     save_scalers: bool = True
