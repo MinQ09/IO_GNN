@@ -18,8 +18,8 @@ class Config:
     batch_size: int = 32
     lr: float = 0.005
     weight_decay: float = 0.0001
-    epochs: int = 500
-    patience: int =  500
+    epochs: int = 300
+    patience: int =  300
     seeds: List[int] = field(default_factory=lambda: [123])
 
     # ─────────────────────────── Paths ──────────────────────────────────────
@@ -56,7 +56,7 @@ class Config:
     depth_edge: int = 3
 
     # ─────────────────────────── Sweep (non-grid) ──────────────────────────
-    lambda_candidates: List[float] = field(default_factory=lambda: [0,0.05])
+    lambda_candidates: List[float] = field(default_factory=lambda: [0,0.01])
     beta_candidates:   List[float] = field(default_factory=lambda: [0.0])
 
     # ─────────────────────────── Grid-search flags ─────────────────────────
