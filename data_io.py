@@ -17,7 +17,7 @@ from copy import deepcopy
 from constants import EPS  # unchanged
 
 # ───────────────────────────── constants ────────────────────────────────
-NODE_COLS: Sequence[str] = ("Import", "Export", "Final_Demand")
+NODE_COLS: Sequence[str] = ("Imports", "Exports", "Final_Demand")
 SCALE_FACTOR = 1e6  # Z, VA, Total scaled down by 1e6
 
 # ───────────────────────────── utils ────────────────────────────────────
