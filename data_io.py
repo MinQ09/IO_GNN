@@ -18,7 +18,7 @@ from constants import EPS  # unchanged
 
 # ───────────────────────────── constants ────────────────────────────────
 NODE_COLS: Sequence[str] = ("Imports", "Exports", "Final_Demand")
-SCALE_FACTOR = 1e6  # Z, VA, Total scaled down by 1e6
+SCALE_FACTOR = 1e3  # Z, VA, Total scaled down by 1e6
 
 # ───────────────────────────── utils ────────────────────────────────────
 
