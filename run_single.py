@@ -1,11 +1,11 @@
-# run_single.py ────────────────────────────────────────────────
+# run_single.py ────────────────────────────────────────────────────────────────
 """
 Single-run trainer for IO-GNN with:
-  - Raw-scale targets (Z/VA)
+  - Raw-scale Z / (optionally standardized) VA targets
   - Relative PINN losses
   - Optional rolling-window CV
   - Adaptive lambda with warm-up
-  - Full-forward PINN (compute constraint on the entire graph set)
+  - Full-forward PINN (constraint computed on the entire train set)
 """
 
 from __future__ import annotations
@@ -35,34 +35,86 @@ from metrics import mae, mean_ignore_nan, rmse, r2, safe_pearson, smape
 from model import IOGNN_Z, IOGNN_VA
 from utils import set_seed
 
-
 # ------------------------------- Helpers --------------------------------
 
 def _slice_batch(cat: torch.Tensor, graphs: List[pyg.data.Data], edge: bool):
-    """Yield (slice, graph) pairs for concatenated predictions."""
+    """
+    Yield (slice, graph) pairs for a concatenated prediction tensor.
+
+    Assumptions
+    -----------
+    - `cat` is 1-D and was built by concatenating per-graph targets/predictions
+      in the same order as `graphs`.
+    - Each graph's target is scalar per item (edge or node). If you move to
+      multi-dimensional targets, ensure you flatten both prediction and target
+      the same way and use `.view(-1).numel()` below.
+    """
     offs = 0
     for g in graphs:
-        span = g.edge_attr.numel() if edge else g.num_nodes
+        if edge:
+            # Flatten to be robust to shapes like [E] or [E, 1] or [E, d]
+            span = g.edge_attr.view(-1).numel()
+        else:
+            # For VA, same robustness: [N] or [N, 1] or [N, d]
+            span = g.va.view(-1).numel() if hasattr(g, "va") else g.num_nodes
         yield cat[offs:offs + span], g
         offs += span
 
 
 def _adaptive_lambda(*, mse: torch.Tensor, pinn: torch.Tensor, cfg, global_step: int) -> torch.Tensor:
     """
-    Adaptive lambda with warm-up and scale matching.
-    λ_t = warmup_factor * λ_max * sqrt(MSE / (PINN + ε)), clipped to [0.1, 10] factor.
+    Adaptive lambda with warm-up and basic scale matching.
+
+      λ_t = warmup_factor * λ_max * sqrt(MSE / (PINN + ε))
+
+    Notes
+    -----
+    - We detach MSE/PINN to avoid backprop through λ_t.
+    - Clamped ratio guards against extreme oscillations.
+    - Optionally cap the final λ_t as well (configurable).
     """
-    warm_steps = getattr(cfg, "warmup", 0)
-    warm = 1.0 if warm_steps == 0 else min(1.0, global_step / max(1, warm_steps))
-    ratio = torch.sqrt(mse.detach() / (pinn.detach() + 1e-12)).clamp(min=0.1, max=10.0)
-    return warm * cfg.lambda_max * ratio
+    eps = getattr(cfg, "eps", 1e-12)
+    clip_min = getattr(cfg, "lambda_ratio_min", 0.3)
+    clip_max = getattr(cfg, "lambda_ratio_max", 5.0)
+    lam_cap  = getattr(cfg, "lambda_cap", None)  # e.g., 10.0
+
+    warm_steps = int(getattr(cfg, "warmup", 0))
+    if warm_steps <= 0:
+        warm = 1.0
+    else:
+        warm = min(1.0, float(global_step) / float(max(1, warm_steps)))
+
+    # Detach to keep λ_t non-differentiable
+    ratio = torch.sqrt(mse.detach() / (pinn.detach() + eps)).clamp(min=clip_min, max=clip_max)
+    lam_t = ratio * float(getattr(cfg, "lambda_max", 0.0)) * warm
+    if lam_cap is not None:
+        lam_t = torch.clamp(lam_t, max=float(lam_cap))
+    return lam_t
 
 
 def is_identity_scaler(scaler) -> bool:
-    """Detect if a StandardScaler is effectively identity."""
-    return (hasattr(scaler, 'scale_') and hasattr(scaler, 'mean_')
-            and abs(float(scaler.scale_[0]) - 1.0) < 1e-6
-            and abs(float(scaler.mean_[0])) < 1e-6)
+    """
+    Detect if a StandardScaler is effectively identity-like (all dims).
+    Returns True if all scales ≈ 1 and all means ≈ 0.
+
+    Works with sklearn scalers that expose `scale_` and `mean_`.
+    """
+    if not (hasattr(scaler, "scale_") and hasattr(scaler, "mean_")):
+        return False
+    # Use vector-wise checks for robustness
+    try:
+        scale = np.asarray(scaler.scale_, dtype=float)
+        mean  = np.asarray(scaler.mean_, dtype=float)
+        return np.allclose(scale, 1.0, atol=1e-6) and np.allclose(mean, 0.0, atol=1e-6)
+    except Exception:
+        # Fallback to the original single-dim heuristic
+        try:
+            return (
+                abs(float(scaler.scale_[0]) - 1.0) < 1e-6
+                and abs(float(scaler.mean_[0])) < 1e-6
+            )
+        except Exception:
+            return False
 
 
 def _full_forward_concat(
@@ -72,26 +124,86 @@ def _full_forward_concat(
 ) -> Tuple[torch.Tensor, List[pyg.data.Data]]:
     """
     Forward the model over ALL graphs in `full_loader` and concatenate predictions.
-    Keeps autograd graph so gradients flow from PINN to model parameters.
-    Returns:
-      out_cat : 1D tensor concatenating predictions across graphs
-      graphs  : list[Data] aligned with `out_cat` slicing
+    Keeps autograd graph so gradients can flow from the PINN loss to model parameters.
+
+    Returns
+    -------
+    out_cat : 1-D tensor concatenating predictions across graphs (same dtype as model params)
+    graphs  : list[Data] aligned with `out_cat` slicing
     """
-    outs, graphs = [], []
+    outs: List[torch.Tensor] = []
+    graphs: List[pyg.data.Data] = []
+
+    was_training = model.training
+    model.eval()  # disable dropout/bn updates, still keeps gradients (no torch.no_grad)
+
     for seqs, tgts in full_loader:
         seqs = [[g.to(device) for g in s] for s in seqs]
         tgts = [g.to(device) for g in tgts]
-        pred_cat, *_ = model(seqs, tgts)
+        pred_cat, *_ = model(seqs, tgts)  # keep graph for backprop
         outs.append(pred_cat)
         graphs.extend(tgts)
-    out_cat = torch.cat(outs, dim=0) if outs else torch.tensor([], device=device)
-    return out_cat, graphs
 
+    if was_training:
+        model.train()
+
+    if outs:
+        out_cat = torch.cat(outs, dim=0)
+    else:
+        # Empty tensor with the same dtype/device as the model’s parameters
+        try:
+            p = next(model.parameters())
+            out_cat = torch.empty(0, dtype=p.dtype, device=p.device)
+        except StopIteration:
+            out_cat = torch.empty(0, device=device)
+
+    return out_cat, graphs
+# --- keep your helpers as-is but make this small tweak ---
+def _inverse_standardize_torch_flat(x_flat: torch.Tensor,
+                                    mean: torch.Tensor,
+                                    scale: torch.Tensor,
+                                    feature_dim: int = 1) -> torch.Tensor:
+    """Differentiable inverse transform for flattened targets."""
+    if feature_dim == 1:
+        return x_flat * scale + mean
+    total = x_flat.numel()
+    assert total % feature_dim == 0, "x_flat length must be divisible by feature_dim"
+    # reshape -> affine -> flatten
+    x = x_flat.reshape(-1, feature_dim)
+    x = x * scale + mean
+    return x.reshape(-1)
+
+def _va_scaler_stats_as_tensors(scalers, device, dtype) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """
+    Extract VA scaler stats from sklearn StandardScaler into torch tensors.
+
+    Returns
+    -------
+    mean_t, scale_t, feature_dim
+      - mean_t/scale_t are 1-D tensors (shape [d]) ready for broadcast
+      - feature_dim=d (1 for scalar VA)
+    """
+    va_scaler = scalers['node']['value_added']
+    # Fallbacks: mean=0, scale=1
+    mean_np = getattr(va_scaler, "mean_", 0.0)
+    scale_np = getattr(va_scaler, "scale_", 1.0)
+
+    mean_t = torch.as_tensor(mean_np, device=device, dtype=dtype)
+    scale_t = torch.as_tensor(scale_np, device=device, dtype=dtype)
+
+    # Ensure 1-D shape (even for scalar)
+    if mean_t.ndim == 0:
+        mean_t = mean_t.view(1)
+    if scale_t.ndim == 0:
+        scale_t = scale_t.view(1)
+
+    feature_dim = int(mean_t.numel())
+    return mean_t, scale_t, feature_dim
 
 # ------------------------- Rolling Window CV -----------------------------
 
 class RollingWindowSplit(BaseCrossValidator):
-    """Time-series rolling-window cross-validation over an ordered list X (e.g., years)."""
+    """Time-series rolling-window CV over an ordered list X (e.g., years)."""
     def __init__(self, n_splits: int = 3, train_size: Optional[int] = None, test_size: int = 2, gap: int = 0):
         self.n_splits, self.train_size, self.test_size, self.gap = n_splits, train_size, test_size, gap
 
@@ -111,6 +223,7 @@ class RollingWindowSplit(BaseCrossValidator):
     def get_n_splits(self, X=None, y=None, groups=None):
         return self.n_splits
 
+# --- train_and_eval_fold: make CV use raw-scale PINN for VA, and compute R2 on output scale ---
 
 def train_and_eval_fold(
     fold_id: int,
@@ -129,12 +242,22 @@ def train_and_eval_fold(
     scalers = deepcopy(tr_ds.get_scalers())
     vl_ds = GraphWindowDataset(val_years, cfg, scalers=scalers, fit_scalers=False, scale_targets=False)
 
-    tr_ld = DataLoader(tr_ds, batch_size=cfg.batch_size, shuffle=True,  collate_fn=collate_window)
-    vl_ld = DataLoader(vl_ds, batch_size=cfg.batch_size, shuffle=False, collate_fn=collate_window)
+    # (optional) reproducible generator
+    # g = torch.Generator(device="cpu").manual_seed(int(getattr(cfg, "seeds", [0])[0]))
+    tr_ld = DataLoader(tr_ds, batch_size=cfg.batch_size, shuffle=True,  collate_fn=collate_window)  # , generator=g
+    vl_ld = DataLoader(vl_ds, batch_size=cfg.batch_size, shuffle=False, collate_fn=collate_window)  # , generator=g
 
     model = model_cls(nfeat=getattr(tr_ds, 'nfeat', 3), cfg=cfg).to(cfg.device)
     optim = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     pinn_fn = pinn_loss_z_batch_rel if edge_mode else pinn_loss_va_batch_raw
+
+    # Precompute VA scaler tensors once for this fold (only used if scale_targets=True)
+    va_mean_t = va_scale_t = None
+    va_feat_dim = 1
+    if (not edge_mode) and bool(getattr(cfg, "scale_targets", False)):
+        va_mean_t, va_scale_t, va_feat_dim = _va_scaler_stats_as_tensors(
+            scalers, device=cfg.device, dtype=torch.float32  # or model param dtype
+        )
 
     for _ in range(getattr(cfg, 'fold_epochs', 5)):
         model.train()
@@ -143,7 +266,19 @@ def train_and_eval_fold(
             tgts = [g.to(cfg.device) for g in tgts]
             pred, *_ = model(seqs, tgts)
             tgt = torch.cat([g.edge_attr if edge_mode else g.va for g in tgts])
-            loss = F.mse_loss(pred, tgt) + pinn_fn(pred, tgts)
+
+            # CV PINN on the right scale
+            if edge_mode:
+                pinn_term = pinn_fn(pred, tgts)  # Z is already raw-ish scale
+            else:
+                # VA: inverse to raw if targets were standardized
+                if bool(getattr(cfg, "scale_targets", False)):
+                    pred_raw_va = _inverse_standardize_torch_flat(pred, va_mean_t, va_scale_t, feature_dim=va_feat_dim)
+                else:
+                    pred_raw_va = pred
+                pinn_term = pinn_fn(pred_raw_va, tgts)
+
+            loss = F.mse_loss(pred, tgt) + pinn_term
             optim.zero_grad(); loss.backward(); optim.step()
 
     model.eval()
@@ -154,11 +289,22 @@ def train_and_eval_fold(
             tgts = [g.to(cfg.device) for g in tgts]
             pred, *_ = model(seqs, tgts)
             tgt = torch.cat([g.edge_attr if edge_mode else g.va for g in tgts])
-            scores.append(r2(pred, tgt))
+
+            # Compute R² on output scale for fair comparison
+            if edge_mode or (not bool(getattr(cfg, "scale_targets", False))):
+                pred_o, tgt_o = pred, tgt
+            else:
+                pred_o = _inverse_standardize_torch_flat(pred, va_mean_t, va_scale_t, feature_dim=va_feat_dim)
+                # tgt is standardized VA; inverse as well to match units
+                tgt_o  = _inverse_standardize_torch_flat(tgt,  va_mean_t, va_scale_t, feature_dim=va_feat_dim)
+
+            if edge_mode or (not bool(getattr(cfg, "scale_targets", False))):
+                tgt_o = tgt  # ensure both paths define tgt_o
+            scores.append(r2(pred_o, tgt_o))
+
     fold_r2 = float(np.mean(scores)) if scores else 0.0
     tqdm.write(f"[Fold {fold_id+1}] R² = {fold_r2:.3f}")
     return fold_r2
-
 
 # ------------------------------- Main Run --------------------------------
 
@@ -167,25 +313,45 @@ def run_single(cfg: Any, seed: int, *, kind: str = "Z"):
     edge_mode = (kind == "Z")
     model_cls = IOGNN_Z if edge_mode else IOGNN_VA
 
-    # Use a simple sequential list as "years" to demo splits; replace with real indices if needed
-    years = list(range(1, 67))
+    # Prefer config-provided years; fall back to a safe default
+    years = getattr(cfg, "years", None)
+    if not years:
+        # TODO: infer from available files under cfg.data_dir if possible
+        years = list(range(1, 21))
 
     # Optional rolling-window CV branch
     if getattr(cfg, 'rolling_val', False):
         splitter = RollingWindowSplit(
-            n_splits=cfg.rolling_splits,
+            n_splits=int(cfg.rolling_splits),
             train_size=cfg.rolling_train_size,
-            test_size=cfg.rolling_test_size,
-            gap=cfg.rolling_gap
+            test_size=int(cfg.rolling_test_size),
+            gap=int(cfg.rolling_gap)
         )
-        fold_r2 = []
-        for k, (tr_idx, vl_idx) in enumerate(splitter.split(years)):
-            set_seed(seed + k)
-            fold_r2.append(train_and_eval_fold(k, model_cls, cfg, years, tr_idx, vl_idx, edge_mode))
-        mean_r2, std_r2 = float(np.mean(fold_r2)), float(np.std(fold_r2))
-        print(f"\n>> Rolling-CV R² = {mean_r2:.3f} ± {std_r2:.3f}")
-        return None, None, None, {'ROLLING_R2': mean_r2, 'ROLLING_R2_STD': std_r2}
 
+        fold_r2: List[float] = []
+        for k, (tr_idx, vl_idx) in enumerate(splitter.split(years)):
+            # Reseed per-fold for reproducibility (data shuffling, init, etc.)
+            set_seed(seed + k)
+            r2_k = train_and_eval_fold(k, model_cls, cfg, years, tr_idx, vl_idx, edge_mode)
+            fold_r2.append(r2_k)
+
+        # Guard: no valid folds produced
+        if len(fold_r2) == 0:
+            raise ValueError(
+                "RollingWindowSplit produced 0 folds. "
+                "Check that the time series length is sufficient for "
+                f"window={getattr(cfg, 'window', 1)}, "
+                f"train_size={cfg.rolling_train_size or 'auto(≈70%)'}, "
+                f"test_size={cfg.rolling_test_size}, gap={cfg.rolling_gap}, "
+                f"n_splits={cfg.rolling_splits}."
+            )
+
+        mean_r2 = float(np.mean(fold_r2))
+        std_r2 = float(np.std(fold_r2, ddof=1)) if len(fold_r2) > 1 else 0.0
+
+        print(f"\n>> Rolling-CV R² over {len(fold_r2)} folds = {mean_r2:.3f} ± {std_r2:.3f}")
+        return None, None, None, {'ROLLING_R2': mean_r2, 'ROLLING_R2_STD': std_r2}
+    
     # --------------------- Standard train/val/test ----------------------
 
     # Output directory
@@ -193,7 +359,7 @@ def run_single(cfg: Any, seed: int, *, kind: str = "Z"):
     save_dir.mkdir(parents=True, exist_ok=True)
 
     # Splits
-    tr_y, vl_y, ts_y = years[:-12], years[-12:-6], years[-6:]
+    tr_y, vl_y, ts_y = years[:-4], years[-4:-2], years[-2:]
     tr_ds = GraphWindowDataset(tr_y, cfg, scalers=None, fit_scalers=True, scale_targets=False)
     scalers = deepcopy(tr_ds.get_scalers())
     vl_ds = GraphWindowDataset(vl_y, cfg, scalers=scalers, fit_scalers=False, scale_targets=False)
@@ -230,7 +396,7 @@ def run_single(cfg: Any, seed: int, *, kind: str = "Z"):
     print("="*35)
 
     # Full-forward recompute cadence for PINN
-    PINN_FULL_EVERY = int(getattr(cfg, "pinn_full_every", 1))  # 1 = recompute every step
+    PINN_FULL_EVERY = int(getattr(cfg, "pinn_full_every", 1))  # 1 = recompute every batch
     full_pred_cache = None
     full_graphs_cache = None
     full_cache_step = -1
@@ -245,15 +411,19 @@ def run_single(cfg: Any, seed: int, *, kind: str = "Z"):
             seqs = [[g.to(cfg.device) for g in s] for s in seqs]
             tgts = [g.to(cfg.device) for g in tgts]
 
-            # 1) Batch prediction loss (L_pred)
+            # 1) Prediction loss on the batch
             pred_raw, *_ = model(seqs, tgts)
             tgt_raw = torch.cat([g.edge_attr if edge_mode else g.va for g in tgts])
             mse = F.mse_loss(pred_raw, tgt_raw)
 
-            # 2) Full-forward PINN (L_bal) with current params
+            # 2) Full-forward PINN with current params
             need_refresh = (full_cache_step < 0) or ((b_idx % PINN_FULL_EVERY) == 0)
             if need_refresh:
                 full_pred, full_graphs = _full_forward_concat(model, full_pin_loader, cfg.device)
+                # IMPORTANT: for VA, transform predictions to raw scale before PINN
+                if not edge_mode:  # kind == "VA"
+                    mean_t, scale_t, feat_dim = _va_scaler_stats_as_tensors(scalers, full_pred.device, full_pred.dtype)
+                    full_pred = _inverse_standardize_torch_flat(full_pred, mean_t, scale_t, feature_dim=feat_dim)
                 full_pred_cache, full_graphs_cache = full_pred, full_graphs
                 full_cache_step = b_idx
             else:
@@ -271,7 +441,7 @@ def run_single(cfg: Any, seed: int, *, kind: str = "Z"):
             torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
             optim.step()
 
-            # 5) Optional output-space metrics (identity fast-path)
+            # 5) Output-space metrics (identity fast-path)
             if is_identity_scaler(target_scaler):
                 pred_o, tgt_o = pred_raw, tgt_raw
             else:
@@ -307,8 +477,14 @@ def run_single(cfg: Any, seed: int, *, kind: str = "Z"):
                 pred_raw, *_ = model(seqs, tgts)
                 tgt_raw = torch.cat([g.edge_attr if edge_mode else g.va for g in tgts])
 
-                # Use same PINN definition; for validation we can reuse lam_avg for reporting
-                pinn = pinn_fn(pred_raw, tgts)
+                # Same PINN definition; branch by kind for scale correctness
+                if edge_mode:  # Z
+                    pinn = pinn_fn(pred_raw, tgts)  # Z is already on raw scale
+                else:          # VA
+                    mean_t, scale_t, feat_dim = _va_scaler_stats_as_tensors(scalers, pred_raw.device, pred_raw.dtype)
+                    va_pred_raw = _inverse_standardize_torch_flat(pred_raw, mean_t, scale_t, feature_dim=feat_dim)
+                    pinn = pinn_fn(va_pred_raw, tgts)
+
                 mse = F.mse_loss(pred_raw, tgt_raw)
                 v_tot += float((mse + lam_avg * pinn).item())
                 v_mse += float(mse.item())
@@ -360,7 +536,7 @@ def run_single(cfg: Any, seed: int, *, kind: str = "Z"):
                 msg += f" | IOIS {hist['val_IOIS'][-1]:.2e}"
             tqdm.write(msg)
 
-        # Early stopping on total val objective
+        # Early stopping on total validation objective
         monitor = hist["val_tot"][-1]
         if monitor < best_metric - 1e-8:
             best_metric = monitor
@@ -419,7 +595,8 @@ def run_single(cfg: Any, seed: int, *, kind: str = "Z"):
 
     # ------------------------------ Save ------------------------------
     scalers_path = save_dir / "scalers.pkl"
-    pickle.dump(scalers, open(scalers_path, "wb"))
+    with open(scalers_path, "wb") as f:
+        pickle.dump(scalers, f)
     dump_pred_matrices(
         model, scalers_path,
         years=ts_y,

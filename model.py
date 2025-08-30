@@ -4,33 +4,42 @@ Graph-temporal models for IO-GNN.
 
 Components
 ----------
-- AttChebDirConv : Directional Chebyshev filter with analysis-only attention
+- AttChebDirConv : Directional Chebyshev filter with optional attention
 - GCLSTMCell     : LSTM cell using AttChebDirConv for gates
-- IOGNN_Z        : Edge-level next-step flow predictor
-- IOGNN_VA       : Node-level next-step value-added predictor
+- IOGNN_Z        : Edge-level next-step flow predictor (to be defined elsewhere)
+- IOGNN_VA       : Node-level next-step value-added predictor (to be defined elsewhere)
 """
 
 from __future__ import annotations
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 import torch
 import torch.nn as nn
 from torch import Tensor
-from torch_geometric.data import Data
 from torch_geometric.nn import ChebConv
 from torch_geometric.utils import softmax
+from torch_geometric.data import Data
 
 
 # ───────────────────────── AttChebDirConv ─────────────────────────
 class AttChebDirConv(nn.Module):
     """
-    Directional Chebyshev convolution with analysis-only attention.
+    Directional Chebyshev convolution with optional analysis-only attention.
 
-    Notes
-    -----
-    - `last_att_out` and `last_att_in` are attention scores normalised
-      over outgoing (per source) and incoming (per target) edges respectively.
-    - Attention is computed under `torch.no_grad()` and does not affect training.
+    Parameters
+    ----------
+    fin, fout : int
+        Input/output feature dimensions.
+    k : int
+        Chebyshev polynomial order.
+    alpha_init : float
+        Initial mixing coefficient for forward/backward outputs.
+    learn_alpha : bool
+        Whether to learn the mixing coefficient α.
+    att_hidden : int
+        Hidden dimension for attention projections.
+    compute_attention : bool
+        If True, compute attention scores for analysis (not used in training loss).
     """
 
     def __init__(
@@ -41,8 +50,10 @@ class AttChebDirConv(nn.Module):
         alpha_init: float = 0.5,
         learn_alpha: bool = True,
         att_hidden: int = 64,
+        compute_attention: bool = True,
     ):
         super().__init__()
+        self.compute_attention = compute_attention
 
         # Directional Chebyshev filters
         self.fwd_conv = ChebConv(fin, fout, k)
@@ -58,9 +69,9 @@ class AttChebDirConv(nn.Module):
         beta = torch.logit(torch.tensor(alpha_init, dtype=torch.float32))
         self._beta = nn.Parameter(beta) if learn_alpha else beta  # type: ignore[assignment]
 
-        # Safe default buffers for first access
+        # Buffers for last attention scores (analysis only)
         self.register_buffer("last_att_out", torch.empty(0))
-        self.register_buffer("last_att_in",  torch.empty(0))
+        self.register_buffer("last_att_in", torch.empty(0))
 
     @property
     def alpha(self) -> Tensor:
@@ -69,31 +80,44 @@ class AttChebDirConv(nn.Module):
 
     def forward(
         self,
-        x: Tensor,            # [N, F_in]
-        edge_index: Tensor,   # [2, E]  (source, target)
-        edge_weight: Tensor | None = None,
+        x: Tensor,                   # [N, F_in]
+        edge_index: Tensor,          # [2, E]  (source, target)
+        edge_weight: Optional[Tensor] = None,
     ) -> Tensor:
         s, t = edge_index  # source, target
 
         # (1) Directional Chebyshev outputs
         out_fwd = self.fwd_conv(x, edge_index, edge_weight)
-        out_bwd = self.bwd_conv(x, edge_index.flip(0), edge_weight)
+        out_bwd = self.bwd_conv(x, edge_index.flip(0), edge_weight)  # backward edges: no weights by default
         out = self.alpha * out_fwd + (1.0 - self.alpha) * out_bwd
 
         # (2) Attention scores (analysis only; no gradients)
-        with torch.no_grad():
-            q = self.to_q(x)           # [N, H]
-            k = self.to_k(x)           # [N, H]
-            e = (q[s] * k[t]).sum(-1)  # [E], dot-product score
-            if edge_weight is not None:
-                e = e * edge_weight
-            att_out = softmax(e, index=s, num_nodes=x.size(0))  # outgoing
-            att_in  = softmax(e, index=t, num_nodes=x.size(0))  # incoming
-            self.last_att_out = att_out.detach()
-            self.last_att_in  = att_in.detach()
+        if self.compute_attention:
+            with torch.no_grad():
+                q = self.to_q(x)           # [N, H]
+                k = self.to_k(x)           # [N, H]
+                e = (q[s] * k[t]).sum(-1)  # [E], dot-product score
+                if edge_weight is not None:
+                    e = e * edge_weight
+                self.last_att_out = softmax(e, index=s, num_nodes=x.size(0)).detach()
+                self.last_att_in  = softmax(e, index=t, num_nodes=x.size(0)).detach()
+        else:
+            # Empty placeholders to avoid stale values
+            self.last_att_out = x.new_empty(0)
+            self.last_att_in  = x.new_empty(0)
 
         return out
 
+    def compute_att(self, x, edge_index, edge_weight):
+        with torch.no_grad():
+            s, t = edge_index
+            q, k = self.to_q(x), self.to_k(x)
+            e = (q[s] * k[t]).sum(-1)
+            if edge_weight is not None:
+                e = e * edge_weight
+            att_out = softmax(e, index=s, num_nodes=x.size(0)).detach()
+            att_in  = softmax(e, index=t, num_nodes=x.size(0)).detach()
+        return att_out, att_in
 
 # ─────────────────────────── GCLSTMCell ───────────────────────────
 class GCLSTMCell(nn.Module):
@@ -111,9 +135,15 @@ class GCLSTMCell(nn.Module):
         super().__init__()
         self.use_attention = use_attention
         self.hid = hid
+        self.hidden_proj = nn.Linear(hid, hid)
 
         def conv(fi: int, fo: int) -> AttChebDirConv:
-            return AttChebDirConv(fi, fo, k, alpha_init, learn_alpha=True, att_hidden=att_hidden)
+            return AttChebDirConv(
+                fi, fo, k, alpha_init,
+                learn_alpha=True,
+                att_hidden=att_hidden,
+                compute_attention=self.use_attention
+            )
 
         self.Fx, self.Fh = conv(fin, hid), conv(hid, hid)
         self.Ix, self.Ih = conv(fin, hid), conv(hid, hid)
@@ -130,27 +160,24 @@ class GCLSTMCell(nn.Module):
         self,
         x: Tensor,
         ei: Tensor,
-        ew: Tensor | None,
-        h: Tensor | None = None,
-        c: Tensor | None = None,
+        ew: Optional[Tensor],
+        h: Optional[Tensor] = None,
+        c: Optional[Tensor] = None,
     ) -> tuple[Tensor, Tensor]:
         n = x.size(0)
         if h is None or c is None:
             h = x.new_zeros(n, self.hid)
             c = x.new_zeros(n, self.hid)
 
-        if self.use_attention:
-            xf, hf = self.Fx(x, ei, ew), self.Fh(h, ei, ew)
-            xi, hi = self.Ix(x, ei, ew), self.Ih(h, ei, ew)
-            xo, ho = self.Ox(x, ei, ew), self.Oh(h, ei, ew)
-            xg, hg = self.Gx(x, ei, ew), self.Gh(h, ei, ew)
-        else:
-            # Use dummy unit weights to keep shapes without attention weighting
-            ew_dummy = torch.ones(ei.size(1), device=ei.device)
-            xf, hf = self.Fx(x, ei, ew_dummy), self.Fh(h, ei, ew_dummy)
-            xi, hi = self.Ix(x, ei, ew_dummy), self.Ih(h, ei, ew_dummy)
-            xo, ho = self.Ox(x, ei, ew_dummy), self.Oh(h, ei, ew_dummy)
-            xg, hg = self.Gx(x, ei, ew_dummy), self.Gh(h, ei, ew_dummy)
+        h_res = self.hidden_proj(h)
+
+        # When use_attention=False, ignore edge weights in convolutions
+        ew_in = ew if self.use_attention else None
+
+        xf, hf = self.Fx(x, ei, ew_in), self.Fh(h, ei, ew_in)
+        xi, hi = self.Ix(x, ei, ew_in), self.Ih(h, ei, ew_in)
+        xo, ho = self.Ox(x, ei, ew_in), self.Oh(h, ei, ew_in)
+        xg, hg = self.Gx(x, ei, ew_in), self.Gh(h, ei, ew_in)
 
         f = torch.sigmoid(self.ln_f(xf + hf))
         i = torch.sigmoid(self.ln_i(xi + hi))
@@ -158,9 +185,8 @@ class GCLSTMCell(nn.Module):
         g = torch.tanh(   self.ln_g(xg + hg))
 
         c_new = f * c + i * g
-        h_new = o * torch.tanh(self.ln_c(c_new))
+        h_new = o * torch.tanh(self.ln_c(c_new)) + h_res
         return h_new, c_new
-
 
 # ───────────────────────────── helper MLP ─────────────────────────────
 def mlp(
@@ -192,8 +218,8 @@ class IOGNN_Z(nn.Module):
         # Backbone
         self.pre = nn.Sequential(
             nn.Linear(nfeat, cfg.hidden),
-            nn.GELU(),
             nn.LayerNorm(cfg.hidden),
+            nn.GELU(),
         )
         self.cell = GCLSTMCell(
             fin=cfg.hidden, hid=cfg.hidden, k=cfg.k,
@@ -226,8 +252,8 @@ class IOGNN_Z(nn.Module):
                 h, c = self.cell(self.pre(g.x), g.edge_index, g.edge_attr, h, c)
 
             # analysis-only attention (from output gate)
-            att_o.append(self.cell.Ox.last_att_out)
-            att_i.append(self.cell.Ox.last_att_in)
+            ao, ai = self.cell.Ox.compute_att(h,tgt.edge_index, tgt.edge_attr)
+            att_o.append(ao); att_i.append(ai)
 
             s, t = tgt.edge_index
             pairs = torch.cat([h[s], h[t]], dim=1)
@@ -306,10 +332,10 @@ class IOGNN_VA(nn.Module):
             h = c = None
             for g in seq:
                 h, c = self.cell(self.pre(g.x), g.edge_index, g.edge_attr, h, c)
-
-            att_o.append(self.cell.Ox.last_att_out)
-            att_i.append(self.cell.Ox.last_att_in)
             va_outs.append(self.dec_node(h).squeeze(-1))  # [N]
+
+            ao, ai = self.cell.Ox.compute_att(h,tgt.edge_index, tgt.edge_attr)
+            att_o.append(ao); att_i.append(ai)
 
         return torch.cat(va_outs), torch.cat(att_o), torch.cat(att_i)
 

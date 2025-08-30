@@ -205,7 +205,7 @@ def save_edge_attention(
     heat_out[s, t] = att_out
 
     heat_in = torch.zeros_like(heat_out)
-    heat_in[s, t] = att_in
+    heat_in[t, s] = att_in
 
     pd.DataFrame(heat_out.cpu().numpy()) \
       .to_csv(save_dir / f"{file_prefix}_attn_out.csv", index=False, float_format=float_fmt)

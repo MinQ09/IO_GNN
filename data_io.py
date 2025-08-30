@@ -17,8 +17,8 @@ from copy import deepcopy
 from constants import EPS  # unchanged
 
 # ───────────────────────────── constants ────────────────────────────────
-NODE_COLS: Sequence[str] = ("Imports", "Exports", "Final_Demand")
-SCALE_FACTOR = 1e3  # Z, VA, Total scaled down by 1e6
+NODE_COLS: Sequence[str] = ("Import", "Export", "Final_Demand")
+SCALE_FACTOR = 1e6  # Z, VA, Total scaled down by 1e6 for numerical stability
 
 # ───────────────────────────── utils ────────────────────────────────────
 
@@ -30,23 +30,29 @@ def _safe_read_csv(path: Path) -> pd.DataFrame:
     )
 
 def _protect_zero_variance(scaler: StandardScaler) -> None:
+    # Avoid division by zero when a column is constant
     scaler.scale_[scaler.scale_ == 0.0] = 1.0
 
 def _identity_scaler() -> StandardScaler:
+    # Minimal fitted-like scaler that acts as identity
     s = StandardScaler()
     s.mean_  = np.zeros(1, dtype=np.float32)
     s.scale_ = np.ones (1, dtype=np.float32)
     s.var_   = np.ones (1, dtype=np.float32)
     return s
 
-# single helper kept – all inverse transforms route here
-
+# Single helper – all inverse transforms route here (torch-friendly)
 def _inverse_1d(std: Tensor, scaler: StandardScaler) -> Tensor:
-    """Inverse transform a 1-D tensor with *scaler* (handles identity fast)."""
-    if abs(scaler.scale_[0] - 1.0) < 1e-6 and abs(scaler.mean_[0]) < 1e-6:
+    """
+    Inverse transform a 1-D (or flattened) tensor with *scaler*; identity fast-path.
+    Note: current pipeline uses scalar targets so broadcasting is trivial.
+    """
+    scale_np = getattr(scaler, "scale_", np.array([1.0], dtype=np.float32))
+    mean_np  = getattr(scaler, "mean_",  np.array([0.0], dtype=np.float32))
+    if np.allclose(scale_np, 1.0, atol=1e-6) and np.allclose(mean_np, 0.0, atol=1e-6):
         return std
-    scale = torch.as_tensor(scaler.scale_,  dtype=std.dtype, device=std.device)
-    mean  = torch.as_tensor(scaler.mean_,   dtype=std.dtype, device=std.device)
+    scale = torch.as_tensor(scale_np, dtype=std.dtype, device=std.device)
+    mean  = torch.as_tensor(mean_np,  dtype=std.dtype, device=std.device)
     return std * scale + mean
 
 # ----------------------------------------------------------------------
@@ -59,9 +65,21 @@ def load_nodes(
     *,
     fit: bool = True,
     scale_node_feats: bool = True,
-    scale_va_tot: bool = False,  # <- now honoured
-) -> Tuple[Tensor, Tensor, Tensor, Tensor, Dict[str, StandardScaler]]:
-    """Load node-level features / targets and return (x_std, x_raw, va_std, tot_std)."""
+    scale_va_tot: bool = False,  # honored via cfg.scale_targets at call sites
+) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Dict[str, StandardScaler]]:
+    """
+    Load node-level features / targets.
+
+    Returns
+    -------
+    x      : standardized node features (or raw if scale_node_feats=False)
+    x_raw  : raw node features (scaled only by SCALE_FACTOR)
+    va     : value added (standardized if scale_va_tot=True, else raw)
+    tot    : total (standardized if scale_va_tot=True, else raw)
+    va_raw : raw value added (scaled only by SCALE_FACTOR)
+    tot_raw: raw total (scaled only by SCALE_FACTOR)
+    scalers: dict with keys {"node_features", "value_added", "total"}
+    """
     df = _safe_read_csv(csv_path).astype(np.float32)
 
     # scalers dict initialisation -------------------------------------------------
@@ -85,7 +103,8 @@ def load_nodes(
         else:
             x_std = scalers["node_features"].transform(x_np)
     else:
-        scalers["node_features"] = _identity_scaler(); x_std = x_np
+        scalers["node_features"] = _identity_scaler()
+        x_std = x_np
 
     # (2) VA / Total scaling (optional) ------------------------------------------
     if scale_va_tot:
@@ -98,18 +117,17 @@ def load_nodes(
             va_std = scalers["value_added"].transform(va_np)
             tot_std = scalers["total"].transform(tot_np)
     else:
-        if scalers["value_added"] is None:
-            scalers["value_added"] = _identity_scaler()
-        if scalers["total"] is None:
-            scalers["total"] = _identity_scaler()
+        # Always override with identity scalers to ensure mean_/scale_ exist
+        scalers["value_added"] = _identity_scaler()
+        scalers["total"]       = _identity_scaler()
         va_std, tot_std = va_np, tot_np
 
     # tensors --------------------------------------------------------------------
-    x     = torch.from_numpy(x_std).float()
-    x_raw = torch.from_numpy(x_np ).float()
-    va    = torch.from_numpy(va_std.squeeze()).float()
-    tot   = torch.from_numpy(tot_std.squeeze()).float()
-    va_raw = torch.from_numpy(va_np.squeeze()).float()
+    x       = torch.from_numpy(x_std).float()
+    x_raw   = torch.from_numpy(x_np ).float()
+    va      = torch.from_numpy(va_std.squeeze()).float()
+    tot     = torch.from_numpy(tot_std.squeeze()).float()
+    va_raw  = torch.from_numpy(va_np.squeeze()).float()
     tot_raw = torch.from_numpy(tot_np.squeeze()).float()
     return x, x_raw, va, tot, va_raw, tot_raw, scalers
 
@@ -124,7 +142,7 @@ def load_edges(
     apply_scaler: bool = True,
     ensure_symmetric: bool = False,
 ) -> Tuple[Tensor, Tensor, StandardScaler]:
-    """Return (edge_index, edge_weight, scaler). scaler is identity by default."""
+    """Return (edge_index, edge_weight, scaler). 'scaler' is identity by default."""
     df = (
         pd.read_csv(csv_path, thousands=",")
           .replace(["–", "-", ""], 0.0)
@@ -143,7 +161,7 @@ def load_edges(
     edge_val = vals.to_numpy(dtype=np.float32).reshape(-1, 1)
     if apply_scaler:
         edge_val /= SCALE_FACTOR
-    scaler = _identity_scaler()  # placeholder; could swap for real scaler if needed
+    scaler = _identity_scaler()  # placeholder; keep identity unless you add a true edge scaler
     edge_wt = torch.from_numpy(edge_val.squeeze()).float()
     return edge_idx, edge_wt, scaler
 
@@ -156,7 +174,7 @@ def make_graph(
     e_csv: Path,
     *,
     node_scalers: Optional[Dict[str, StandardScaler]] = None,
-    edge_scaler: Optional[StandardScaler] = None,
+    edge_scaler: Optional[StandardScaler] = None,   # kept for signature parity
     fit_scalers: bool = True,
     scale_node_feats: bool = True,
     scale_va_tot: bool = False,
@@ -175,14 +193,21 @@ def make_graph(
         apply_scaler=apply_edge_scaler,
         ensure_symmetric=False,
     )
-    return Data(x=x, x_raw=x_raw, edge_index=ei, edge_attr=ew, va=va, tot=tot, va_raw=va_raw, tot_raw=tot_raw), node_scalers, edge_scaler
+    data = Data(
+        x=x, x_raw=x_raw,
+        edge_index=ei, edge_attr=ew,
+        va=va, tot=tot,
+        va_raw=va_raw, tot_raw=tot_raw
+    )
+    return data, node_scalers, edge_scaler
 
 # ----------------------------------------------------------------------
 # dataset
 # ----------------------------------------------------------------------
 
 class GraphWindowDataset(Dataset):
-    """Returns (history_graphs_A, target_graph_Z)."""
+    """Returns (history_graphs_A, target_graph_Z). 
+       Nowcasting 모드: 히스토리의 마지막 시점(t) 자체를 예측."""
     def __init__(
         self,
         years: List[int],
@@ -190,7 +215,7 @@ class GraphWindowDataset(Dataset):
         scalers: Optional[Dict[str, Any]] = None,
         *,
         fit_scalers: bool = True,
-        scale_targets: bool = False,  # kept for interface compatibility
+        scale_targets: bool = False,
     ):
         self.window = cfg.window
         base = Path(cfg.data_dir)
@@ -208,7 +233,7 @@ class GraphWindowDataset(Dataset):
                 edge_scaler=self.scalers["edge_A"],
                 fit_scalers=fit_scalers,
                 scale_node_feats=True,
-                scale_va_tot=True,
+                scale_va_tot=bool(getattr(cfg, "scale_va_tot", False)),
                 apply_edge_scaler=False,
             )
             g_Z, _, _ = make_graph(
@@ -218,28 +243,25 @@ class GraphWindowDataset(Dataset):
                 edge_scaler=self.scalers["edge_Z"],
                 fit_scalers=False,
                 scale_node_feats=True,
-                scale_va_tot= True,
+                scale_va_tot=bool(getattr(cfg, "scale_va_tot", False)),
                 apply_edge_scaler=True,
             )
             self.graphs_A.append(g_A)
             self.graphs_Z.append(g_Z)
 
-        # expose feature dim
         self.nfeat = len(NODE_COLS)
 
-    # --------------------------------------------------
     def get_scalers(self) -> Dict[str, Any]:
-        """Deep copy to prevent accidental mutation by caller."""
         return deepcopy(self.scalers)
 
-    # Torch Dataset protocol ---------------------------
     def __len__(self) -> int:
-        return len(self.graphs_A) - self.window
+        return len(self.graphs_A) - self.window + 1
 
     def __getitem__(self, idx: int):
-        return self.graphs_A[idx:idx + self.window], self.graphs_Z[idx + self.window]
-
-# ----------------------------------------------------------------------
+        seq = self.graphs_A[idx : idx + self.window]
+        tgt = self.graphs_Z[idx + self.window - 1]
+        return seq, tgt
+    
 # convenience I/O helpers
 # ----------------------------------------------------------------------
 
@@ -247,7 +269,6 @@ def save_scalers(scalers: Dict[str, Any], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "wb") as f:
         pickle.dump(scalers, f)
-
 
 def load_scalers(path: Path) -> Dict[str, Any]:
     with open(path, "rb") as f:
@@ -262,7 +283,6 @@ def inverse_transform_predictions(pred_std: Tensor, scalers: Dict[str, Any], kin
         return _inverse_1d(pred_std, scalers["edge_Z"])
     else:  # VA
         return _inverse_1d(pred_std, scalers["node"]["value_added"])
-
 
 def inverse_transform_targets(tgt_std: Tensor, scalers: Dict[str, Any], kind: str) -> Tensor:
     return inverse_transform_predictions(tgt_std, scalers, kind)
