@@ -9,14 +9,23 @@ DEBUG_Z_PRINT: bool = False
 _DEBUG_PRINTED_Z: int = 0
 _DEBUG_MAX_Z: int = 1
 
+# -------------------- helpers --------------------
 
-def _rel_err(residual: Tensor, scale: Tensor, eps: float = EPS) -> Tensor:
+def _stable_den(tot_raw: Tensor, *, q: float = 0.05, gamma: float = 0.5, floor: float = 1e-6) -> Tensor: 
     """
-    Relative error: |residual| / (|scale| + eps)
-    `scale` should be a positive baseline per node (e.g., g.tot_raw).
+    Build a robust denominator per node:
+      den = max(|TOT|, quantile_q(|TOT|)) ** gamma
     """
-    return residual.abs() / (scale.abs() + eps)
+    den = tot_raw.abs()
+    p = torch.quantile(den.detach(), q).clamp_min(floor)  # detach: no grad needed
+    den = torch.maximum(den, p).pow(gamma)
+    return den
 
+def _rel_err(residual: Tensor, den: Tensor) -> Tensor:
+    """Relative error with robust denominator."""
+    return residual.abs() / (den + EPS)
+
+# -------------------- single-graph PINNs -----------------
 
 def pinn_single_z_raw(
     z_raw: Tensor,
@@ -24,79 +33,72 @@ def pinn_single_z_raw(
     *,
     w_row: float = 1.0,
     w_col: float = 0.0,
+    q: float = 0.05,
+    gamma: float = 0.5,
 ) -> Tensor:
     """
-    Single-graph PINN term for Z on a relative (per-node) basis.
-    - Primary term (IOIS-like): |row - col| / TOT_i
-    - Optional net-balance term: |(row + FD + EXP - IMP) - (col + VA)| / TOT_i
-
-    Returns a scalar loss averaged over nodes.
+    Single-graph PINN term for Z using robust relative residuals.
+    - IOIS-like: |row - col| / den
+    - Optional net-balance: |(row + FD + EXP - IMP) - (col + VA)| / den
     """
-    src, trg = g.edge_index
+    s, t = g.edge_index
     n = g.num_nodes
 
-    row = torch.zeros(n, device=z_raw.device).index_add_(0, src, z_raw)
-    col = torch.zeros(n, device=z_raw.device).index_add_(0, trg, z_raw)
+    row = torch.zeros(n, device=z_raw.device).index_add_(0, s, z_raw)
+    col = torch.zeros(n, device=z_raw.device).index_add_(0, t, z_raw)
+
+    den = _stable_den(g.tot_raw, q=q, gamma=gamma)
 
     # IOIS-style residual (relative per node)
-    resid_io_rel = (row - col).abs() / (g.tot_raw.abs() + EPS)
+    resid_io_rel = _rel_err(row - col, den)
 
     # Optional net residual (also relative)
     imp_raw, exp_raw, fd_raw = g.x_raw.T
     row_imb = row + fd_raw + exp_raw - imp_raw
     col_imb = col + g.va_raw
-    resid_net_rel = (row_imb - col_imb).abs() / (g.tot_raw.abs() + EPS)
+    resid_net_rel = _rel_err(row_imb - col_imb, den)
 
     if DEBUG_Z_PRINT and _should_print_z_debug():
         _print_z_debug(z_raw, g, tag="pinn_single_z_raw")
 
-    # Mean over nodes (balanced across sectors)
-    loss = w_row * resid_io_rel.mean() + w_col * resid_net_rel.mean()
-    return loss
-
+    return w_row * resid_io_rel.mean() + w_col * resid_net_rel.mean()
 
 def pinn_single_va_raw(
     va_raw: Tensor,
     g: Data,
     *,
     w_col: float = 1.0,
+    q: float = 0.05,
+    gamma: float = 0.5,
 ) -> Tensor:
     """
-    Single-graph PINN term for VA on a relative (per-node) basis.
-    Enforces: Z·1 + VA ≈ TOT  (column balance)
-    Uses relative residual: |(col_sum(Z) + VA - TOT)| / TOT
+    Single-graph PINN term for VA (column balance), robust relative residual:
+      |(col_sum(Z) + VA - TOT)| / den
     """
-    _, trg = g.edge_index
+    _, t = g.edge_index
     n = g.num_nodes
 
-    col_z = torch.zeros(n, device=va_raw.device).index_add_(0, trg, g.edge_attr)
+    col_z = torch.zeros(n, device=va_raw.device).index_add_(0, t, g.edge_attr)
     col_imb = col_z + va_raw - g.tot_raw
 
-    col_res = _rel_err(col_imb, g.tot_raw)
-    return w_col * col_res.mean()
+    den = _stable_den(g.tot_raw, q=q, gamma=gamma)
+    col_res = _rel_err(col_imb, den).mean()
+    return w_col * col_res  # ← 중복 mean 제거
 
+# -------------------- batch PINNs --------------------
 
 def pinn_loss_z_batch_rel(
     z_cat: Tensor,
     batch: List[Data],
     *,
     include_exogenous: bool = True,
+    q: float = 0.05,
+    gamma: float = 0.5,
 ) -> Tensor:
     """
-    Batch PINN loss for Z using node-wise relative residuals (recommended).
-
-    For each graph:
-      - Compute row/col sums from predicted z
-      - If include_exogenous:
-           row = Σ_j Z_ij + FD_i + EXP_i - IMP_i
-           col = Σ_j Z_ji + VA_i
-        else:
-           row = Σ_j Z_ij
-           col = Σ_j Z_ji
-      - Node-wise relative residual: |row_i - col_i| / (TOT_i + eps)
-      - Average over nodes per graph, then average over graphs
+    Batch PINN loss for Z with robust node-wise relative residuals.
     """
-    acc = z_cat.new_tensor(0.0)
+    total = z_cat.new_tensor(0.0)
     num_graphs = 0
     off = 0
 
@@ -118,37 +120,38 @@ def pinn_loss_z_batch_rel(
         else:
             row, col = row_z, col_z
 
-        rel = (row - col).abs() / (g.tot_raw.abs() + EPS)
-        acc = acc + rel.mean()
+        den = _stable_den(g.tot_raw, q=q, gamma=gamma)
+        rel = _rel_err(row - col, den).mean()
+
+        total = total + rel
         num_graphs += 1
 
-    return acc / max(1, num_graphs)
+    return total / max(1, num_graphs)
 
-
-def pinn_loss_va_batch_raw(va_cat: Tensor, batch: List[Data]) -> Tensor:
+def pinn_loss_va_batch_raw(
+    va_cat: Tensor,
+    batch: List[Data],
+    *,
+    q: float = 0.05,
+    gamma: float = 0.5,
+) -> Tensor:
     """
-    Batch PINN loss for VA using relative column-balance residuals per graph.
+    Batch PINN loss for VA with robust column-balance residuals per graph.
     """
     off, losses = 0, []
     for g in batch:
         n = g.num_nodes
         va_slice = va_cat[off:off + n]
         off += n
-        losses.append(pinn_single_va_raw(va_slice, g))
+        losses.append(pinn_single_va_raw(va_slice, g, q=q, gamma=gamma))
     return torch.stack(losses).mean()
 
-
 def get_pinn_loss_function(kind: str) -> Callable:
-    """
-    Convenience selector if you want to fetch the PINN loss by kind.
-    For 'Z', returns the relative (balanced) formulation by default.
-    """
     if kind == "Z":
         return pinn_loss_z_batch_rel
     if kind == "VA":
         return pinn_loss_va_batch_raw
     raise ValueError(f"Unknown kind: {kind}")
-
 
 # ---------------------- Optional debug utilities ----------------------
 
@@ -159,22 +162,17 @@ def _should_print_z_debug() -> bool:
         return True
     return False
 
-
 def _print_z_debug(z_raw: Tensor, g: Data, tag: str) -> None:
-    """
-    One-time diagnostic print for ranges and residuals in Z prediction.
-    Useful when wiring datasets or checking units/scales.
-    """
-    src, trg = g.edge_index
+    s, t = g.edge_index
     n = g.num_nodes
 
-    row = torch.zeros(n, device=z_raw.device).index_add_(0, src, z_raw)
-    col = torch.zeros(n, device=z_raw.device).index_add_(0, trg, z_raw)
+    row = torch.zeros(n, device=z_raw.device).index_add_(0, s, z_raw)
+    col = torch.zeros(n, device=z_raw.device).index_add_(0, t, z_raw)
     imp_raw, exp_raw, fd_raw = g.x_raw.T
     tot_raw, va_raw = g.tot_raw, g.va_raw
 
-    def _rng(t: Tensor) -> str:
-        return f"{t.min():8.4g} → {t.max():8.4g}"
+    def _rng(x: Tensor) -> str:
+        return f"{x.min():8.4g} → {x.max():8.4g}"
 
     print(f"\n── DEBUG ({tag}) ─────────────────────────")
     print(f"row_sum : {_rng(row)}")
