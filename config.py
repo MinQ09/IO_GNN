@@ -1,4 +1,4 @@
-# config.py  — improved
+# config.py  — no-validation ready
 from __future__ import annotations
 
 from dataclasses import dataclass, field, asdict, replace
@@ -18,15 +18,15 @@ class Config:
     weight_decay: float = 0.0001
     epochs: int = 500
     patience: int = 500
-    seeds: List[int] = field(default_factory=lambda: [123,456,789,1234,12345])
+    seeds: List[int] = field(default_factory=lambda: [12,34,56])
 
     # ───────── Paths ─────────
     data_dir: Path = Path("./Data")
-    out_dir: Path = Path("./Results/V5050")
+    out_dir: Path = Path("./Results/V58")
     scalers_fname: str = "scalers.pkl"
 
     # ───────── Scaling & window ─────────
-    window: int = 2
+    window: int = 4
     scale_node_feats: bool = True
     scale_targets: bool = False
     save_scalers: bool = True
@@ -40,8 +40,8 @@ class Config:
     fold_epochs: int = 5  # reserved for RW-CV inner training epochs
 
     # ───────── PINN / multi-task ─────────
-    lambda_max: float = 0.5
-    warmup: int = 20
+    lambda_max: float = 1
+    warmup: int = 50
     beta_x: float = 0.0
     beta_init: float = 0.1
 
@@ -54,7 +54,7 @@ class Config:
     depth_edge: int = 3
 
     # ───────── Sweep (non-grid) ─────────
-    lambda_candidates: List[float] = field(default_factory=lambda: [0, 0.1])
+    lambda_candidates: List[float] = field(default_factory=lambda: [0,0.5])
     beta_candidates:   List[float] = field(default_factory=lambda: [0.0])
 
     # ───────── Grid-search flags/axes ─────────
@@ -70,6 +70,7 @@ class Config:
 
     # ───────── Misc ─────────
     log_every: int = 10
+    use_validation: bool = False   # ← 추가: 표준 경로에서 검증 세트 사용 여부 (기본 False)
     device: str = field(init=False, repr=False)
 
     # ================= Initialization =================
@@ -103,6 +104,7 @@ class Config:
         assert self.att_hidden > 0 and self.depth_edge >= 1, "invalid attention/depth settings"
         assert self.window >= 1, "window length must be ≥ 1"
 
+        # RW-CV 사용 시에만 해당 검증
         if self.rolling_val:
             assert self.rolling_splits >= 2, "rolling_splits must be ≥ 2 when rolling_val=True"
             assert self.rolling_test_size >= 1, "rolling_test_size must be ≥ 1"
@@ -139,7 +141,6 @@ class Config:
     def generate_grid_configs(self) -> List["Config"]:
         """Return a list of immutable Config objects – one per grid point."""
         if not self.grid_search:
-            # For non-grid runs, keep a single normalized copy (device will be recomputed in __post_init__)
             base = asdict(self)
             base.pop("device", None)
             return [Config(**base)]
@@ -160,7 +161,7 @@ class Config:
         for i, (bs, lr, wd, h, k, dp, lam, scale_tg, seed) in enumerate(combos):
             cfg = replace(
                 self,
-                grid_search=False,              # materialize each config
+                grid_search=False,
                 batch_size=bs,
                 lr=lr,
                 weight_decay=wd,
@@ -172,8 +173,7 @@ class Config:
                 seeds=[seed],
                 out_dir=(self.out_dir / f"grid_{i:03d}_{h}h_{k}k_dp{dp}_{self._lr_tag(lr)}_lam{lam}"),
             )
-            # Re-run post init validations and ensure dir exists
-            cfg.__post_init__()
+            cfg.__post_init__()  # validate + ensure dir exists
             configs.append(cfg)
         return configs
 
