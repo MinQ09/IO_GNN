@@ -16,8 +16,8 @@ class Config:
     batch_size: int = 64
     lr: float = 0.005
     weight_decay: float = 0.0001
-    epochs: int = 300
-    patience: int = 300
+    epochs: int = 500
+    patience: int = 500
     seeds: List[int] = field(default_factory=lambda: [123,456,789,1234])
 
     # ───────── Paths ─────────
