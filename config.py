@@ -18,7 +18,7 @@ class Config:
     weight_decay: float = 0.0001
     epochs: int = 500
     patience: int = 500
-    seeds: List[int] = field(default_factory=lambda: [123,456,789,1234])
+    seeds: List[int] = field(default_factory=lambda: [123,456,789,1234,12345])
 
     # ───────── Paths ─────────
     data_dir: Path = Path("./Data")
