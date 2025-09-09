@@ -18,18 +18,18 @@ class Config:
     lr: float = 0.005                         # Effective lr in run_single is lr*0.2; keep this and use scheduler to decay
     weight_decay: float = 5e-4
     epochs: int = 1000                        # Longer training for stability (was 500)
-    patience: int = 300                       # Tighter early stop (was 300)
+    patience: int = 200                       # Tighter early stop (was 300)
     seeds: List[int] = field(default_factory=lambda: [123])
 
     # ───────── Paths ─────────
     data_dir: Path = Path("/Users/mingyu/Desktop/IO_GNN-main/Data")
-    out_dir: Path = Path("/Users/mingyu/Desktop/IO_GNN-main/Results/V66")
+    out_dir: Path = Path("/Users/mingyu/Desktop/IO_GNN-main/Results/V71")
     scalers_fname: str = "scalers.pkl"
 
     # ───────── Scaling & window ─────────
     window: int = 2
     scale_node_feats: bool = True
-    scale_targets: bool = False
+    scale_targets: bool = True
     save_scalers: bool = True
 
     # ───────── Rolling-Window CV ─────────

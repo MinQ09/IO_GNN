@@ -8,6 +8,7 @@ Single-run trainer for IO-GNN with:
   - Full-forward PINN (constraint computed on the entire train set)
   - (NEW) ReduceLROnPlateau scheduler (optional, config-controlled)
   - (NEW) PINN full-forward cadence via cfg.pinn_full_every
+  - (NEW) Per-epoch train logs + validation logs every VAL_LOG_EVERY epochs
 """
 
 from __future__ import annotations
@@ -41,17 +42,7 @@ from utils import set_seed
 # ------------------------------- Helpers --------------------------------
 
 def _slice_batch(cat: torch.Tensor, graphs: List[pyg.data.Data], edge: bool):
-    """
-    Yield (slice, graph) pairs for a concatenated prediction tensor.
-
-    Assumptions
-    -----------
-    - `cat` is 1-D and was built by concatenating per-graph targets/predictions
-      in the same order as `graphs`.
-    - Each graph's target is scalar per item (edge or node). If you move to
-      multi-dimensional targets, ensure you flatten both prediction and target
-      the same way and use `.view(-1).numel()` below.
-    """
+    """Yield (slice, graph) pairs for a concatenated prediction tensor."""
     offs = 0
     for g in graphs:
         if edge:
@@ -64,8 +55,7 @@ def _slice_batch(cat: torch.Tensor, graphs: List[pyg.data.Data], edge: bool):
 
 def _adaptive_lambda(*, mse: torch.Tensor, pinn: torch.Tensor, cfg, global_step: int) -> torch.Tensor:
     """
-    Adaptive lambda with warm-up and basic scale matching.
-
+    Adaptive lambda with warm-up and basic scale matching:
       λ_t = warmup_factor * λ_max * sqrt(MSE / (PINN + ε))
     """
     eps = getattr(cfg, "eps", 1e-12)
@@ -180,6 +170,18 @@ def _current_lr(optim: torch.optim.Optimizer) -> float:
     return float("nan")
 
 
+def _first(x, default: float) -> float:
+    """Robustly get first scalar from scaler attributes for printing."""
+    try:
+        arr = np.asarray(x, dtype=float)
+        return float(arr.flat[0])
+    except Exception:
+        try:
+            return float(x)
+        except Exception:
+            return float(default)
+
+
 # ------------------------- Rolling Window CV -----------------------------
 
 class RollingWindowSplit(BaseCrossValidator):
@@ -204,7 +206,7 @@ class RollingWindowSplit(BaseCrossValidator):
         return self.n_splits
 
 
-# --- CV fold (unchanged logic except VA inverse for PINN and R2 on output scale) ---
+# --- CV fold (VA PINN uses raw-scale; metrics on output scale) ---
 
 def train_and_eval_fold(
     fold_id: int,
@@ -219,9 +221,12 @@ def train_and_eval_fold(
     train_years = [years[i] for i in tr_idx]
     val_years   = [years[i] for i in vl_idx]
 
-    tr_ds = GraphWindowDataset(train_years, cfg, scalers=None, fit_scalers=True, scale_targets=False)
+    # Respect cfg.scale_targets for VA only
+    use_scaled_tgts = (not edge_mode) and bool(getattr(cfg, "scale_targets", False))
+
+    tr_ds = GraphWindowDataset(train_years, cfg, scalers=None,  fit_scalers=True,  scale_targets=use_scaled_tgts)
     scalers = deepcopy(tr_ds.get_scalers())
-    vl_ds = GraphWindowDataset(val_years, cfg, scalers=scalers, fit_scalers=False, scale_targets=False)
+    vl_ds = GraphWindowDataset(val_years,   cfg, scalers=scalers, fit_scalers=False, scale_targets=use_scaled_tgts)
 
     tr_ld = DataLoader(tr_ds, batch_size=cfg.batch_size, shuffle=True,  collate_fn=collate_window)
     vl_ld = DataLoader(vl_ds, batch_size=cfg.batch_size, shuffle=False, collate_fn=collate_window)
@@ -319,12 +324,15 @@ def run_single(cfg: Any, seed: int, *, kind: str = "Z"):
     save_dir = Path(cfg.out_dir) / f"seed_{seed}" / f"lam_{cfg.lambda_max:.4g}" / kind
     save_dir.mkdir(parents=True, exist_ok=True)
 
+    # Respect cfg.scale_targets for VA only
+    use_scaled_tgts = (not edge_mode) and bool(getattr(cfg, "scale_targets", False))
+
     # Splits
     tr_y, vl_y, ts_y = years[:-4], years[-4:-2], years[-2:]
-    tr_ds = GraphWindowDataset(tr_y, cfg, scalers=None, fit_scalers=True, scale_targets=False)
+    tr_ds = GraphWindowDataset(tr_y, cfg, scalers=None,  fit_scalers=True,  scale_targets=use_scaled_tgts)
     scalers = deepcopy(tr_ds.get_scalers())
-    vl_ds = GraphWindowDataset(vl_y, cfg, scalers=scalers, fit_scalers=False, scale_targets=False)
-    ts_ds = GraphWindowDataset(ts_y, cfg, scalers=scalers, fit_scalers=False, scale_targets=False)
+    vl_ds = GraphWindowDataset(vl_y, cfg, scalers=scalers, fit_scalers=False, scale_targets=use_scaled_tgts)
+    ts_ds = GraphWindowDataset(ts_y, cfg, scalers=scalers, fit_scalers=False, scale_targets=use_scaled_tgts)
 
     # Loaders
     tr_ld = DataLoader(tr_ds, batch_size=cfg.batch_size, shuffle=True,  collate_fn=collate_window)
@@ -354,7 +362,10 @@ def run_single(cfg: Any, seed: int, *, kind: str = "Z"):
     # PINN loss function
     pinn_fn = pinn_loss_z_batch_rel if edge_mode else pinn_loss_va_batch_raw
 
+    # Target scaler handle (for printing + metrics inverse-transform)
     target_scaler = scalers['edge_Z'] if edge_mode else scalers['node']['value_added']
+    t_mean = _first(getattr(target_scaler, "mean_", 0.0), 0.0)
+    t_scale = _first(getattr(target_scaler, "scale_", 1.0), 1.0)
 
     keys = ("train_tot","train_mse","train_pinn","train_R2",
             "val_tot","val_mse","val_pinn","val_RMSE","val_MAE",
@@ -365,7 +376,7 @@ def run_single(cfg: Any, seed: int, *, kind: str = "Z"):
 
     print(f"\n=== Scaling Configuration ===")
     print(f"Kind: {kind}")
-    print(f"Target scaler - mean: {target_scaler.mean_[0]:.6f}, scale: {target_scaler.scale_[0]:.6f}")
+    print(f"Target scaler - mean: {t_mean:.6f}, scale: {t_scale:.6f}")
     print(f"Is identity scaler: {is_identity_scaler(target_scaler)}")
     print("="*35)
 
@@ -374,6 +385,9 @@ def run_single(cfg: Any, seed: int, *, kind: str = "Z"):
     full_pred_cache = None
     full_graphs_cache = None
     full_cache_step = -1
+
+    # Per-epoch / per-N-epoch logging
+    VAL_LOG_EVERY = int(getattr(cfg, "val_log_every", 10))
 
     # ------------------------------ Train/Val loop ------------------------------
     for ep in trange(1, cfg.epochs + 1, desc=f"{kind}-seed{seed}"):
@@ -384,7 +398,7 @@ def run_single(cfg: Any, seed: int, *, kind: str = "Z"):
             seqs = [[g.to(cfg.device) for g in s] for s in seqs]
             tgts = [g.to(cfg.device) for g in tgts]
 
-            # 1) Prediction loss on the batch
+            # 1) Prediction loss on the batch (on dataset scale: raw for Z, scaled or raw for VA)
             pred_raw, *_ = model(seqs, tgts)
             tgt_raw = torch.cat([g.edge_attr if edge_mode else g.va for g in tgts])
             mse = F.mse_loss(pred_raw, tgt_raw)
@@ -413,7 +427,7 @@ def run_single(cfg: Any, seed: int, *, kind: str = "Z"):
             torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
             optim.step()
 
-            # 5) Output-space metrics
+            # 5) Output-space metrics (inverse-transform if needed)
             if is_identity_scaler(target_scaler):
                 pred_o, tgt_o = pred_raw, tgt_raw
             else:
@@ -446,9 +460,10 @@ def run_single(cfg: Any, seed: int, *, kind: str = "Z"):
                 pred_raw, *_ = model(seqs, tgts)
                 tgt_raw = torch.cat([g.edge_attr if edge_mode else g.va for g in tgts])
 
-                if edge_mode:  # Z PINN on raw pred
+                # PINN: Z uses raw; VA uses raw-scale (inverse of any standardization)
+                if edge_mode:
                     pinn = pinn_fn(pred_raw, tgts)
-                else:          # VA PINN on raw-scale pred
+                else:
                     mean_t, scale_t, feat_dim = _va_scaler_stats_as_tensors(scalers, pred_raw.device, pred_raw.dtype)
                     va_pred_raw = _inverse_standardize_torch_flat(pred_raw, mean_t, scale_t, feature_dim=feat_dim)
                     pinn = pinn_fn(va_pred_raw, tgts)
@@ -458,6 +473,7 @@ def run_single(cfg: Any, seed: int, *, kind: str = "Z"):
                 v_mse += float(mse.item())
                 v_pinn += float(pinn.item())
 
+                # Output-space metrics
                 if is_identity_scaler(target_scaler):
                     pred_o, tgt_o = pred_raw, tgt_raw
                 else:
@@ -500,11 +516,15 @@ def run_single(cfg: Any, seed: int, *, kind: str = "Z"):
         # Record current LR
         hist["lr"].append(_current_lr(optim))
 
-        # Logging
-        if ep % cfg.log_every == 0:
-            msg = (f"[EP {ep:03d}] train: loss {hist['train_tot'][-1]:.4f} | MSE {hist['train_mse'][-1]:.4f} | "
-                   f"PINN {hist['train_pinn'][-1]:.4f} | λ̄ {lam_avg:.3e} | R² {hist['train_R2'][-1]:.3f}\n"
-                   f"[VAL {ep:03d}] loss {hist['val_tot'][-1]:.4f} | RMSE {hist['val_RMSE'][-1]:.3f} | "
+        # ── Print logs: TRAIN 매 에폭, VAL은 VAL_LOG_EVERY 에폭마다 ─────────────
+        tqdm.write(
+            f"[EP {ep:03d}] train: loss {hist['train_tot'][-1]:.4f} | "
+            f"MSE {hist['train_mse'][-1]:.4f} | PINN {hist['train_pinn'][-1]:.4f} | "
+            f"λ̄ {lam_avg:.3e} | R² {hist['train_R2'][-1]:.3f}"
+        )
+
+        if (ep % VAL_LOG_EVERY) == 0:
+            msg = (f"[VAL {ep:03d}] loss {hist['val_tot'][-1]:.4f} | RMSE {hist['val_RMSE'][-1]:.3f} | "
                    f"MAE {hist['val_MAE'][-1]:.3f} | SMAPE {hist['val_SMAPE'][-1]:.3f} | "
                    f"R² {hist['val_R2'][-1]:.3f} | lr {hist['lr'][-1]:.2e}")
             if edge_mode:
@@ -518,8 +538,7 @@ def run_single(cfg: Any, seed: int, *, kind: str = "Z"):
             if isinstance(watch, list) and len(watch) > 0 and np.isfinite(watch[-1]):
                 val_for_sched = float(watch[-1])
             else:
-                val_for_sched = float(hist["val_tot"][-1])
-
+                val_for_sched = float(hist['val_tot'][-1])
             prev_lr = _current_lr(optim)
             sched.step(val_for_sched)
             new_lr = _current_lr(optim)
