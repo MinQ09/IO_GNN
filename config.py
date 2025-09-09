@@ -1,4 +1,4 @@
-# config.py  — improved (patched)
+# config.py — improved (patched)
 from __future__ import annotations
 
 from dataclasses import dataclass, field, asdict, replace
@@ -8,16 +8,17 @@ import itertools
 import yaml
 import torch
 
+
 @dataclass
 class Config:
     """Top-level configuration for all IO-GNN runs."""
 
     # ───────── Base hyper-params ─────────
     batch_size: int = 64
-    lr: float = 0.005
+    lr: float = 0.005                         # Effective lr in run_single is lr*0.2; keep this and use scheduler to decay
     weight_decay: float = 5e-4
-    epochs: int = 500
-    patience: int = 300
+    epochs: int = 1000                        # Longer training for stability (was 500)
+    patience: int = 300                       # Tighter early stop (was 300)
     seeds: List[int] = field(default_factory=lambda: [123])
 
     # ───────── Paths ─────────
@@ -40,10 +41,21 @@ class Config:
     fold_epochs: int = 5  # reserved for RW-CV inner training epochs
 
     # ───────── PINN / multi-task ─────────
-    lambda_max: float = 1
+    lambda_max: float = 2.0                   # Slightly larger cap to avoid vanishing adaptive λ
     warmup: int = 50
     beta_x: float = 0.0
     beta_init: float = 0.1
+
+    # Full-forward PINN cadence (1 = every batch). Larger = faster/approximate.
+    pinn_full_every: int = 5
+
+    # ───────── LR scheduler (recommended) ─────────
+    # These are read/used by run_single.py when you add ReduceLROnPlateau.
+    use_plateau_scheduler: bool = True
+    plateau_factor: float = 0.5
+    plateau_patience: int = 20
+    plateau_min_lr: float = 1e-5
+    plateau_metric: str = "val_tot"          # Which metric to watch (matches run_single logging keys)
 
     # ───────── Model structure ─────────
     hidden: int = 512
@@ -53,19 +65,19 @@ class Config:
     att_hidden: int = 256
     depth_edge: int = 3
 
-    # NEW: graph/edge options (used by DirMPNN / GraphLSTMCell)
-    # If use_edge_weight=True and edge_feat_dim is None, the model will assume scalar edges (dim=1).
-    edge_feat_dim: Optional[int] = None    # Edge feature dimension; None -> infer (usually 1 if use_edge_weight=True)
-    use_edge_weight: bool = True           # Include edge_attr in message passing
-    use_bwd_weights: bool = False          # Use edge_attr_bwd on backward pass
-    compute_attention: bool = True         # Compute analysis-only attention scores (no-grad)
-    alpha_mode: str = "scalar"             # 'scalar' or 'channel' mixing of fwd/bwd
-    va_nonneg: bool = True                 # Apply Softplus head for VA prediction
+    # ───────── Graph/edge options (DirMPNN / GraphLSTMCell) ─────────
+    # If use_edge_weight=True and edge_feat_dim is None, the model assumes scalar edges (dim=1).
+    edge_feat_dim: Optional[int] = None       # None -> infer (usually 1 if use_edge_weight=True)
+    use_edge_weight: bool = True              # Include edge_attr in message passing
+    use_bwd_weights: bool = False             # Use edge_attr_bwd on backward pass
+    compute_attention: bool = True            # Compute analysis-only attention scores (no-grad)
+    alpha_mode: str = "scalar"                # 'scalar' or 'channel' mixing of fwd/bwd
+    va_nonneg: bool = True                    # Apply Softplus head for VA prediction
 
-    # NEW (4 flags you asked for)
-    use_row_norm: bool = True              # Source row-normalization (1/out-degree) per edge
-    use_edge_mul: bool = True              # Multiplicative edge gating (scalar multiply or learned gate)
-    residual_scale: float = 0.1            # Residual skip scale for h in GraphLSTMCell (e.g., 0.1 ~ 1.0)
+    # Directional normalization & gating
+    use_row_norm: bool = True                 # Source row-normalization (1/out-degree) per edge
+    use_edge_mul: bool = True                 # Multiplicative edge gating (scalar multiply or learned gate)
+    residual_scale: float = 0.1               # Residual skip scale for h in GraphLSTMCell (e.g., 0.1 ~ 1.0)
 
     # ───────── Sweep (non-grid) ─────────
     lambda_candidates: List[float] = field(default_factory=lambda: [0, 1])
@@ -122,6 +134,14 @@ class Config:
         if self.edge_feat_dim is not None:
             assert isinstance(self.edge_feat_dim, int) and self.edge_feat_dim >= 1, \
                 "edge_feat_dim must be None or an integer ≥ 1"
+
+        if self.use_plateau_scheduler:
+            assert self.plateau_factor > 0 and self.plateau_factor < 1.0, "plateau_factor must be in (0,1)"
+            assert self.plateau_patience >= 1, "plateau_patience must be ≥ 1"
+            assert self.plateau_min_lr > 0, "plateau_min_lr must be > 0"
+            assert self.plateau_metric in {
+                "val_tot", "val_RMSE", "val_MAE", "val_SMAPE", "val_R2", "val_RHO", "val_IOIS"
+            }, "plateau_metric must match a logged validation key"
 
         if self.rolling_val:
             assert self.rolling_splits >= 2, "rolling_splits must be ≥ 2 when rolling_val=True"
@@ -225,6 +245,4 @@ class Config:
 
     # (optional) domain metadata
     industry_id_order = list(range(1, 34))  # 1..33
-    node_feature_names = [
-        "Import", "Export", "Final_Demand",
-    ]
+    node_feature_names = ["Import", "Export", "Final_Demand"]
