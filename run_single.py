@@ -240,7 +240,7 @@ def train_and_eval_fold(
     for _ in range(getattr(cfg, 'fold_epochs', 5)):
         model.train()
         for seqs, tgts in tr_ld:
-            seqs = [[g.to(cfg.device) for g in s] for g in seqs]
+            seqs = [[g.to(cfg.device) for g in s] for s in seqs]
             tgts = [g.to(cfg.device) for g in tgts]
             pred, *_ = model(seqs, tgts)
             tgt = torch.cat([g.edge_attr if edge_mode else g.va for g in tgts])
@@ -259,7 +259,7 @@ def train_and_eval_fold(
     scores = []
     with torch.no_grad():
         for seqs, tgts in vl_ld:
-            seqs = [[g.to(cfg.device) for g in s] for g in seqs]
+            seqs = [[g.to(cfg.device) for g in s] for s in seqs]
             tgts = [g.to(cfg.device) for g in tgts]
             pred, *_ = model(seqs, tgts)
             tgt = torch.cat([g.edge_attr if edge_mode else g.va for g in tgts])
@@ -515,7 +515,7 @@ def run_single(cfg: Any, seed: int, *, kind: str = "Z"):
         if use_sched and sched is not None:
             metric_key = sched_metric_key
             watch = hist.get(metric_key, None)
-            if isinstance(watch, list) and len(watch) > 0 and np.isfinite(watch[-1])):
+            if isinstance(watch, list) and len(watch) > 0 and np.isfinite(watch[-1]):
                 val_for_sched = float(watch[-1])
             else:
                 val_for_sched = float(hist["val_tot"][-1])
