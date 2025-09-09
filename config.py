@@ -1,9 +1,9 @@
-# config.py  — improved
+# config.py  — improved (patched)
 from __future__ import annotations
 
 from dataclasses import dataclass, field, asdict, replace
 from pathlib import Path
-from typing import List, Union, Tuple, Dict
+from typing import List, Union, Tuple, Dict, Optional
 import itertools
 import yaml
 import torch
@@ -15,14 +15,14 @@ class Config:
     # ───────── Base hyper-params ─────────
     batch_size: int = 64
     lr: float = 0.005
-    weight_decay: float = 0.0001
+    weight_decay: float = 5e-4
     epochs: int = 500
     patience: int = 300
     seeds: List[int] = field(default_factory=lambda: [123])
 
     # ───────── Paths ─────────
     data_dir: Path = Path("/Users/mingyu/Desktop/IO_GNN-main/Data")
-    out_dir: Path = Path("/Users/mingyu/Desktop/IO_GNN-main/Results/V64")
+    out_dir: Path = Path("/Users/mingyu/Desktop/IO_GNN-main/Results/V65")
     scalers_fname: str = "scalers.pkl"
 
     # ───────── Scaling & window ─────────
@@ -48,17 +48,24 @@ class Config:
     # ───────── Model structure ─────────
     hidden: int = 512
     k: int = 5
-    dropout: float = 0.2
-    alpha: float = 0.5
-    att_hidden: int = 64
+    dropout: float = 0.3
+    alpha: float = 0.7
+    att_hidden: int = 256
     depth_edge: int = 3
 
     # NEW: graph/edge options (used by DirMPNN / GraphLSTMCell)
-    use_edge_weight: bool = True        # include edge_attr in message passing
-    use_bwd_weights: bool = False       # use edge_attr_bwd on backward pass
-    compute_attention: bool = True      # compute analysis-only attention scores
-    alpha_mode: str = "scalar"          # 'scalar' or 'channel' mixing of fwd/bwd
-    va_nonneg: bool = True              # apply Softplus head for VA prediction
+    # If use_edge_weight=True and edge_feat_dim is None, the model will assume scalar edges (dim=1).
+    edge_feat_dim: Optional[int] = None    # Edge feature dimension; None -> infer (usually 1 if use_edge_weight=True)
+    use_edge_weight: bool = True           # Include edge_attr in message passing
+    use_bwd_weights: bool = False          # Use edge_attr_bwd on backward pass
+    compute_attention: bool = True         # Compute analysis-only attention scores (no-grad)
+    alpha_mode: str = "scalar"             # 'scalar' or 'channel' mixing of fwd/bwd
+    va_nonneg: bool = True                 # Apply Softplus head for VA prediction
+
+    # NEW (4 flags you asked for)
+    use_row_norm: bool = True              # Source row-normalization (1/out-degree) per edge
+    use_edge_mul: bool = True              # Multiplicative edge gating (scalar multiply or learned gate)
+    residual_scale: float = 0.1            # Residual skip scale for h in GraphLSTMCell (e.g., 0.1 ~ 1.0)
 
     # ───────── Sweep (non-grid) ─────────
     lambda_candidates: List[float] = field(default_factory=lambda: [0, 1])
@@ -110,6 +117,11 @@ class Config:
         assert self.att_hidden > 0 and self.depth_edge >= 1, "invalid attention/depth settings"
         assert self.window >= 1, "window length must be ≥ 1"
         assert self.alpha_mode in {"scalar", "channel"}, "alpha_mode must be 'scalar' or 'channel'"
+        assert self.residual_scale >= 0.0, "residual_scale must be ≥ 0.0"
+
+        if self.edge_feat_dim is not None:
+            assert isinstance(self.edge_feat_dim, int) and self.edge_feat_dim >= 1, \
+                "edge_feat_dim must be None or an integer ≥ 1"
 
         if self.rolling_val:
             assert self.rolling_splits >= 2, "rolling_splits must be ≥ 2 when rolling_val=True"
@@ -211,6 +223,7 @@ class Config:
         cfg = cls(**raw)
         return cfg
 
+    # (optional) domain metadata
     industry_id_order = list(range(1, 34))  # 1..33
     node_feature_names = [
         "Import", "Export", "Final_Demand",
