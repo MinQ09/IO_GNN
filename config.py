@@ -1,4 +1,4 @@
-# config.py  — no-validation ready
+# config.py  — improved
 from __future__ import annotations
 
 from dataclasses import dataclass, field, asdict, replace
@@ -17,16 +17,16 @@ class Config:
     lr: float = 0.005
     weight_decay: float = 0.0001
     epochs: int = 500
-    patience: int = 500
-    seeds: List[int] = field(default_factory=lambda: [12,34,56])
+    patience: int = 300
+    seeds: List[int] = field(default_factory=lambda: [123])
 
     # ───────── Paths ─────────
-    data_dir: Path = Path("./Data")
-    out_dir: Path = Path("./Results/V58")
+    data_dir: Path = Path("/Users/mingyu/Desktop/IO_GNN-main/Data")
+    out_dir: Path = Path("/Users/mingyu/Desktop/IO_GNN-main/Results/V64")
     scalers_fname: str = "scalers.pkl"
 
     # ───────── Scaling & window ─────────
-    window: int = 4
+    window: int = 2
     scale_node_feats: bool = True
     scale_targets: bool = False
     save_scalers: bool = True
@@ -53,8 +53,15 @@ class Config:
     att_hidden: int = 64
     depth_edge: int = 3
 
+    # NEW: graph/edge options (used by DirMPNN / GraphLSTMCell)
+    use_edge_weight: bool = True        # include edge_attr in message passing
+    use_bwd_weights: bool = False       # use edge_attr_bwd on backward pass
+    compute_attention: bool = True      # compute analysis-only attention scores
+    alpha_mode: str = "scalar"          # 'scalar' or 'channel' mixing of fwd/bwd
+    va_nonneg: bool = True              # apply Softplus head for VA prediction
+
     # ───────── Sweep (non-grid) ─────────
-    lambda_candidates: List[float] = field(default_factory=lambda: [0,0.5])
+    lambda_candidates: List[float] = field(default_factory=lambda: [0, 1])
     beta_candidates:   List[float] = field(default_factory=lambda: [0.0])
 
     # ───────── Grid-search flags/axes ─────────
@@ -70,7 +77,6 @@ class Config:
 
     # ───────── Misc ─────────
     log_every: int = 10
-    use_validation: bool = False   # ← 추가: 표준 경로에서 검증 세트 사용 여부 (기본 False)
     device: str = field(init=False, repr=False)
 
     # ================= Initialization =================
@@ -103,8 +109,8 @@ class Config:
         assert self.warmup >= 0, "warmup must be ≥ 0"
         assert self.att_hidden > 0 and self.depth_edge >= 1, "invalid attention/depth settings"
         assert self.window >= 1, "window length must be ≥ 1"
+        assert self.alpha_mode in {"scalar", "channel"}, "alpha_mode must be 'scalar' or 'channel'"
 
-        # RW-CV 사용 시에만 해당 검증
         if self.rolling_val:
             assert self.rolling_splits >= 2, "rolling_splits must be ≥ 2 when rolling_val=True"
             assert self.rolling_test_size >= 1, "rolling_test_size must be ≥ 1"
@@ -141,6 +147,7 @@ class Config:
     def generate_grid_configs(self) -> List["Config"]:
         """Return a list of immutable Config objects – one per grid point."""
         if not self.grid_search:
+            # For non-grid runs, keep a single normalized copy (device will be recomputed in __post_init__)
             base = asdict(self)
             base.pop("device", None)
             return [Config(**base)]
@@ -161,7 +168,7 @@ class Config:
         for i, (bs, lr, wd, h, k, dp, lam, scale_tg, seed) in enumerate(combos):
             cfg = replace(
                 self,
-                grid_search=False,
+                grid_search=False,              # materialize each config
                 batch_size=bs,
                 lr=lr,
                 weight_decay=wd,
@@ -173,7 +180,8 @@ class Config:
                 seeds=[seed],
                 out_dir=(self.out_dir / f"grid_{i:03d}_{h}h_{k}k_dp{dp}_{self._lr_tag(lr)}_lam{lam}"),
             )
-            cfg.__post_init__()  # validate + ensure dir exists
+            # Re-run post init validations and ensure dir exists
+            cfg.__post_init__()
             configs.append(cfg)
         return configs
 
@@ -202,3 +210,8 @@ class Config:
                 raw[p] = Path(raw[p])
         cfg = cls(**raw)
         return cfg
+
+    industry_id_order = list(range(1, 34))  # 1..33
+    node_feature_names = [
+        "Import", "Export", "Final_Demand",
+    ]

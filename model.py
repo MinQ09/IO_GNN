@@ -1,13 +1,18 @@
 # model.py  ───────────────────────────────────────────────────────────────
 """
-Graph-temporal models for IO-GNN.
+Graph-temporal models for IO-GNN (Directional MPNN + GraphLSTMCell).
 
-Components
-----------
-- AttChebDirConv : Directional Chebyshev filter with optional attention
-- GCLSTMCell     : LSTM cell using AttChebDirConv for gates
-- IOGNN_Z        : Edge-level next-step flow predictor (to be defined elsewhere)
-- IOGNN_VA       : Node-level next-step value-added predictor (to be defined elsewhere)
+Key features
+------------
+- DirMPNN: explicit directional message passing (src→dst)
+- GraphLSTMCell: LSTM-style recurrent cell using DirMPNN gates
+  * forget-gate bias = +1.0 (long-range stability)
+- Backward compatibility:
+  * IOGNN_Z/VA __init__ supports (nfeat, cfg) and (nfeat, edge_feat_dim, cfg)
+  * Provide alias: GCLSTMCell = GraphLSTMCell
+- Flags: compute_attention, use_edge_weight, use_bwd_weights, alpha_mode('scalar'|'channel')
+- Edge decoder features: [h_s, h_t, h_s⊙h_t, |h_s−h_t|]
+- Optional non-negative VA head via cfg.va_nonneg (Softplus)
 """
 
 from __future__ import annotations
@@ -16,133 +21,171 @@ from typing import List, Tuple, Optional
 import torch
 import torch.nn as nn
 from torch import Tensor
-from torch_geometric.nn import ChebConv
-from torch_geometric.utils import softmax
 from torch_geometric.data import Data
-
-
-# ───────────────────────── AttChebDirConv ─────────────────────────
-class AttChebDirConv(nn.Module):
+from torch_geometric.nn import MessagePassing
+from torch_geometric.utils import softmax
+import math
+# ───────────────────────── DirMPNN (Directional MPNN) ─────────────────────────
+class DirMPNN(MessagePassing):
     """
-    Directional Chebyshev convolution with optional analysis-only attention.
+    Explicit directional message passing:
+      m_{i<-j} = phi_m([x_j, x_i, e_{j->i}])
+      x'_i     = alpha * AGG_fwd(m_{i<-j}) + (1-alpha) * AGG_bwd(m_{i->j})
 
-    Parameters
-    ----------
-    fin, fout : int
-        Input/output feature dimensions.
-    k : int
-        Chebyshev polynomial order.
-    alpha_init : float
-        Initial mixing coefficient for forward/backward outputs.
-    learn_alpha : bool
-        Whether to learn the mixing coefficient α.
-    att_hidden : int
-        Hidden dimension for attention projections.
-    compute_attention : bool
-        If True, compute attention scores for analysis (not used in training loss).
+    We compute forward and backward paths separately; mixing via alpha happens
+    in forward() if x_bwd_out is given.
     """
 
     def __init__(
         self,
         fin: int,
         fout: int,
-        k: int = 5,
+        edge_dim: Optional[int] = None,
+        att_hidden: int = 64,
         alpha_init: float = 0.5,
         learn_alpha: bool = True,
-        att_hidden: int = 64,
-        compute_attention: bool = True,
+        alpha_mode: str = "scalar",   # 'scalar' | 'channel'
+        compute_attention: bool = False,
     ):
-        super().__init__()
+        super().__init__(aggr="add", node_dim=0)
+        self.fout = fout
+        self.edge_dim = edge_dim
+        self.expect_edge = edge_dim is not None  # ← NEW: fix input dimensionality
         self.compute_attention = compute_attention
+        self.alpha_mode = alpha_mode
 
-        # Directional Chebyshev filters
-        self.fwd_conv = ChebConv(fin, fout, k)
-        self.bwd_conv = ChebConv(fin, fout, k)
+        xin = fin + fin + (edge_dim or 0)  # [x_src, x_dst, e]
+        hidden = max(fout, fin)
 
-        # Frozen Query / Key projections (analysis only)
+        self.phi_m = nn.Sequential(
+            nn.Linear(xin, hidden),
+            nn.LayerNorm(hidden),
+            nn.GELU(),
+            nn.Linear(hidden, fout),
+        )
+
+        # alpha (mixing forward/backward paths)
+        if alpha_mode == "scalar":
+            beta = torch.logit(torch.tensor(alpha_init, dtype=torch.float32))
+            self._beta = nn.Parameter(beta) if learn_alpha else beta
+        elif alpha_mode == "channel":
+            beta = torch.full((fout,), torch.logit(torch.tensor(alpha_init)), dtype=torch.float32)
+            self._beta = nn.Parameter(beta) if learn_alpha else beta
+        else:
+            raise ValueError("alpha_mode must be 'scalar' or 'channel'")
+
+        # Analysis-only attention (frozen Q/K)
         self.to_q = nn.Linear(fin, att_hidden, bias=False)
         self.to_k = nn.Linear(fin, att_hidden, bias=False)
         for p in (*self.to_q.parameters(), *self.to_k.parameters()):
             p.requires_grad = False
 
-        # Mixing coefficient α (learned in logit space)
-        beta = torch.logit(torch.tensor(alpha_init, dtype=torch.float32))
-        self._beta = nn.Parameter(beta) if learn_alpha else beta  # type: ignore[assignment]
-
-        # Buffers for last attention scores (analysis only)
         self.register_buffer("last_att_out", torch.empty(0))
         self.register_buffer("last_att_in", torch.empty(0))
 
     @property
     def alpha(self) -> Tensor:
-        """Alpha in (0,1), clamped in logit-space for numerical stability."""
-        return torch.sigmoid(self._beta.clamp(-5.0, 5.0))  # type: ignore[attr-defined]
+        a = torch.sigmoid(self._beta.clamp(-5.0, 5.0))
+        if self.alpha_mode == "scalar":
+            return a
+        return a.view(1, -1)  # [1, F]
 
     def forward(
         self,
-        x: Tensor,                   # [N, F_in]
-        edge_index: Tensor,          # [2, E]  (source, target)
-        edge_weight: Optional[Tensor] = None,
+        x: Tensor,               # [N, F_in]
+        edge_index: Tensor,      # [2, E] (src->dst)
+        edge_attr: Optional[Tensor] = None,
+        x_bwd_out: Optional[Tensor] = None,  # precomputed backward output to mix
     ) -> Tensor:
-        s, t = edge_index  # source, target
+        src, dst = edge_index
+        out_fwd = self.propagate(edge_index=edge_index, x=x, edge_attr=edge_attr)
 
-        # (1) Directional Chebyshev outputs
-        out_fwd = self.fwd_conv(x, edge_index, edge_weight)
-        out_bwd = self.bwd_conv(x, edge_index.flip(0), edge_weight)  # backward edges: no weights by default
-        out = self.alpha * out_fwd + (1.0 - self.alpha) * out_bwd
+        out = out_fwd if x_bwd_out is None else (self.alpha * out_fwd + (1.0 - self.alpha) * x_bwd_out)
 
-        # (2) Attention scores (analysis only; no gradients)
+        # analysis-only attention
         if self.compute_attention:
             with torch.no_grad():
-                q = self.to_q(x)           # [N, H]
-                k = self.to_k(x)           # [N, H]
-                e = (q[s] * k[t]).sum(-1)  # [E], dot-product score
-                if edge_weight is not None:
-                    e = e * edge_weight
-                self.last_att_out = softmax(e, index=s, num_nodes=x.size(0)).detach()
-                self.last_att_in  = softmax(e, index=t, num_nodes=x.size(0)).detach()
+                q = self.to_q(x)  # [N, H]
+                k = self.to_k(x)  # [N, H]
+                e = (q[src] * k[dst]).sum(-1)  # [E]
+                # Only apply scalar edge weight when the layer expects edges AND a 1-D edge vector is provided.
+                if self.expect_edge and (edge_attr is not None) and (edge_attr.dim() == 1):
+                    e = e * edge_attr
+                self.last_att_out = softmax(e, index=src, num_nodes=x.size(0)).detach()
+                self.last_att_in  = softmax(e, index=dst, num_nodes=x.size(0)).detach()
         else:
-            # Empty placeholders to avoid stale values
             self.last_att_out = x.new_empty(0)
             self.last_att_in  = x.new_empty(0)
 
         return out
 
-    def compute_att(self, x, edge_index, edge_weight):
+    def message(self, x_i: Tensor, x_j: Tensor, edge_attr: Optional[Tensor]) -> Tensor:
+        # x_j: src, x_i: dst
+        if not self.expect_edge:
+            # Edge features disabled at construction time: ignore runtime edge_attr
+            z = torch.cat([x_j, x_i], dim=-1)
+        else:
+            # Edge features expected: always provide tensor of shape [E, edge_dim]
+            if edge_attr is None:
+                E = x_j.size(0)
+                ea = x_j.new_zeros((E, int(self.edge_dim)))
+            else:
+                ea = edge_attr.unsqueeze(-1) if edge_attr.dim() == 1 else edge_attr
+                if ea.size(-1) != int(self.edge_dim):
+                    raise RuntimeError(
+                        f"[DirMPNN] edge_attr dim mismatch: got {ea.size(-1)} "
+                        f"but layer was built with edge_dim={self.edge_dim}. "
+                        "Set cfg.edge_feat_dim accordingly or disable edges via cfg.use_edge_weight=False."
+                    )
+            z = torch.cat([x_j, x_i, ea], dim=-1)
+        return self.phi_m(z)
+
+    def compute_att(self, x: Tensor, edge_index: Tensor, edge_attr: Optional[Tensor]):
         with torch.no_grad():
             s, t = edge_index
             q, k = self.to_q(x), self.to_k(x)
             e = (q[s] * k[t]).sum(-1)
-            if edge_weight is not None:
-                e = e * edge_weight
+            if self.expect_edge and (edge_attr is not None) and (edge_attr.dim() == 1):
+                e = e * edge_attr
             att_out = softmax(e, index=s, num_nodes=x.size(0)).detach()
             att_in  = softmax(e, index=t, num_nodes=x.size(0)).detach()
         return att_out, att_in
 
-# ─────────────────────────── GCLSTMCell ───────────────────────────
-class GCLSTMCell(nn.Module):
-    """Chebyshev-based Graph Convolutional LSTM cell."""
+# ─────────────────────────── GraphLSTMCell (DirMPNN 기반) ───────────────────────────
+class GraphLSTMCell(nn.Module):
+    """
+    LSTM-style recurrent cell with directional MPNN gates.
+
+    Flags:
+      - compute_attention: only controls attention computation (analysis)
+      - use_edge_weight  : controls edge_attr usage in message passing
+      - use_bwd_weights  : whether to use edge_attr_bwd for backward pass (if provided)
+      - alpha_mode       : 'scalar' or 'channel'
+    """
 
     def __init__(
         self,
         fin: int,
         hid: int,
-        k: int,
-        alpha_init: float,
-        att_hidden: int = 32,
-        use_attention: bool = True,
+        edge_dim: Optional[int],
+        alpha_init: float = 0.5,
+        att_hidden: int = 64,
+        compute_attention: bool = False,
+        use_edge_weight: bool = True,
+        use_bwd_weights: bool = False,
+        alpha_mode: str = "scalar",
     ):
         super().__init__()
-        self.use_attention = use_attention
         self.hid = hid
-        self.hidden_proj = nn.Linear(hid, hid)
+        self.use_edge_weight = use_edge_weight
+        self.use_bwd_weights = use_bwd_weights
 
-        def conv(fi: int, fo: int) -> AttChebDirConv:
-            return AttChebDirConv(
-                fi, fo, k, alpha_init,
-                learn_alpha=True,
-                att_hidden=att_hidden,
-                compute_attention=self.use_attention
+        def conv(fi: int, fo: int) -> DirMPNN:
+            return DirMPNN(
+                fin=fi, fout=fo, edge_dim=edge_dim if self.use_edge_weight else None,
+                att_hidden=att_hidden, alpha_init=alpha_init,
+                learn_alpha=True, alpha_mode=alpha_mode,
+                compute_attention=compute_attention,
             )
 
         self.Fx, self.Fh = conv(fin, hid), conv(hid, hid)
@@ -156,46 +199,88 @@ class GCLSTMCell(nn.Module):
         self.ln_g = nn.LayerNorm(hid)
         self.ln_c = nn.LayerNorm(hid)
 
+        # Residual on h (near-identity)
+        self.hidden_proj = nn.Linear(hid, hid)
+        with torch.no_grad():
+            if self.hidden_proj.weight.shape[0] == self.hidden_proj.weight.shape[1]:
+                nn.init.eye_(self.hidden_proj.weight)
+            else:
+                nn.init.kaiming_uniform_(self.hidden_proj.weight, a=math.sqrt(5))  # fallback
+            nn.init.constant_(self.hidden_proj.bias, 0.0)
+
+        # ── Gate biases (per-feature); forget bias = +1.0 ─────────────────
+        self.b_f = nn.Parameter(torch.ones(hid))   # forget gate bias = +1
+        self.b_i = nn.Parameter(torch.zeros(hid))  # input gate bias  = 0
+        self.b_o = nn.Parameter(torch.zeros(hid))  # output gate bias = 0
+        self.b_g = nn.Parameter(torch.zeros(hid))  # candidate bias   = 0
+
+    def _dir_pass(
+        self,
+        conv_x: DirMPNN, conv_h: DirMPNN,
+        x: Tensor, h: Tensor,
+        edge_index: Tensor,
+        edge_attr: Optional[Tensor],
+        edge_attr_bwd: Optional[Tensor],
+    ) -> Tuple[Tensor, Tensor]:
+        # forward path outputs
+        fx = conv_x(x, edge_index, edge_attr=edge_attr)
+        fh = conv_h(h, edge_index, edge_attr=edge_attr)
+
+        # backward path outputs (mixed inside conv via alpha)
+        bwd_index = edge_index.flip(0)
+        edge_attr_b = edge_attr_bwd if self.use_bwd_weights else None
+
+        fx_b = conv_x(x, bwd_index, edge_attr=edge_attr_b)
+        fh_b = conv_h(h, bwd_index, edge_attr=edge_attr_b)
+
+        fx_mixed = conv_x(x, edge_index, edge_attr=edge_attr, x_bwd_out=fx_b)
+        fh_mixed = conv_h(h, edge_index, edge_attr=edge_attr, x_bwd_out=fh_b)
+        return fx_mixed, fh_mixed
+
     def forward(
         self,
-        x: Tensor,
-        ei: Tensor,
-        ew: Optional[Tensor],
+        x: Tensor,                  # [N, F_in]
+        ei: Tensor,                 # [2, E]
+        ew: Optional[Tensor],       # [E, D] or [E]
         h: Optional[Tensor] = None,
         c: Optional[Tensor] = None,
-    ) -> tuple[Tensor, Tensor]:
+        ew_bwd: Optional[Tensor] = None,  # optional backward weights
+    ) -> Tuple[Tensor, Tensor]:
         n = x.size(0)
         if h is None or c is None:
             h = x.new_zeros(n, self.hid)
             c = x.new_zeros(n, self.hid)
 
-        h_res = self.hidden_proj(h)
+        # Gates with directional mixing inside
+        xf, hf = self._dir_pass(self.Fx, self.Fh, x, h, ei, ew, ew_bwd)
+        xi, hi = self._dir_pass(self.Ix, self.Ih, x, h, ei, ew, ew_bwd)
+        xo, ho = self._dir_pass(self.Ox, self.Oh, x, h, ei, ew, ew_bwd)
+        xg, hg = self._dir_pass(self.Gx, self.Gh, x, h, ei, ew, ew_bwd)
 
-        # When use_attention=False, ignore edge weights in convolutions
-        ew_in = ew if self.use_attention else None
-
-        xf, hf = self.Fx(x, ei, ew_in), self.Fh(h, ei, ew_in)
-        xi, hi = self.Ix(x, ei, ew_in), self.Ih(h, ei, ew_in)
-        xo, ho = self.Ox(x, ei, ew_in), self.Oh(h, ei, ew_in)
-        xg, hg = self.Gx(x, ei, ew_in), self.Gh(h, ei, ew_in)
-
-        f = torch.sigmoid(self.ln_f(xf + hf))
-        i = torch.sigmoid(self.ln_i(xi + hi))
-        o = torch.sigmoid(self.ln_o(xo + ho))
-        g = torch.tanh(   self.ln_g(xg + hg))
+        # LayerNorm then add per-gate bias (forget bias = +1)
+        f = torch.sigmoid(self.ln_f(xf + hf) + self.b_f)
+        i = torch.sigmoid(self.ln_i(xi + hi) + self.b_i)
+        o = torch.sigmoid(self.ln_o(xo + ho) + self.b_o)
+        g = torch.tanh(   self.ln_g(xg + hg) + self.b_g)
 
         c_new = f * c + i * g
-        h_new = o * torch.tanh(self.ln_c(c_new)) + h_res
+        h_new = o * torch.tanh(self.ln_c(c_new)) + self.hidden_proj(h)
         return h_new, c_new
+
+
+# Backward-compat alias
+GCLSTMCell = GraphLSTMCell
+
 
 # ───────────────────────────── helper MLP ─────────────────────────────
 def mlp(
     d_in: int,
     d_hidden: int,
-    depth: int = 3,
+    depth: int = 4,
     dropout: float = 0.2,
+    out_dim: int = 1,
+    out_activation: Optional[nn.Module] = None,
 ) -> nn.Sequential:
-    """Simple MLP block with LayerNorm+GELU, ending with a scalar head."""
     layers: List[nn.Module] = []
     for i in range(depth):
         layers += [
@@ -205,33 +290,88 @@ def mlp(
         ]
         if dropout:
             layers.append(nn.Dropout(dropout))
-    layers.append(nn.Linear(d_hidden, 1))
+    layers.append(nn.Linear(d_hidden, out_dim))
+    if out_activation is not None:
+        layers.append(out_activation)
     return nn.Sequential(*layers)
-
 
 # ───────────────────────────── 1) Edge model ─────────────────────────────
 class IOGNN_Z(nn.Module):
     """Edge-level IO-GNN (predicts next-step inter-industry flows Ẑ_e)."""
 
-    def __init__(self, nfeat: int, cfg):
+    def __init__(self, nfeat: int, *args, **kwargs):
+        """
+        Backward-compatible + keyword-friendly constructor.
+
+        Accepted call patterns:
+          - New style (positional):  IOGNN_Z(nfeat, edge_feat_dim, cfg)
+          - Old style (positional):  IOGNN_Z(nfeat, cfg)  # edge_feat_dim inferred from cfg.edge_feat_dim or None
+          - Keyword style:           IOGNN_Z(nfeat, cfg=..., edge_feat_dim=...)
+
+        Args
+        ----
+        nfeat : int
+            Node feature dimension.
+        edge_feat_dim : Optional[int]
+            Edge feature dimension (e.g., 1 for scalar weights). If None, edges are treated as unweighted.
+        cfg : object
+            Experiment/config object providing hyperparameters and flags, e.g.:
+              - hidden, k/alpha/att_hidden (if used upstream), depth_edge, dropout
+              - compute_attention, use_edge_weight, use_bwd_weights, alpha_mode
+              - edge_feat_dim (optional default for edge_feat_dim)
+        """
         super().__init__()
-        # Backbone
+
+        # Unpack cfg / edge_feat_dim from args and kwargs (backward compatible).
+        cfg = kwargs.get("cfg", None)
+        edge_feat_dim_kw = kwargs.get("edge_feat_dim", None)
+        if cfg is None:
+            if len(args) == 2:
+                edge_feat_dim, cfg = args
+            elif len(args) == 1:
+                (cfg,) = args
+                edge_feat_dim = getattr(cfg, "edge_feat_dim", None)
+            else:
+                raise TypeError(
+                    "IOGNN_Z.__init__ expected (nfeat, cfg) or (nfeat, edge_feat_dim, cfg) "
+                    "or keyword form (nfeat, cfg=..., edge_feat_dim=...)"
+                )
+        else:
+            edge_feat_dim = edge_feat_dim_kw if edge_feat_dim_kw is not None else getattr(cfg, "edge_feat_dim", None)
+
+        if getattr(cfg, "use_edge_weight", True) and (edge_feat_dim is None):
+            edge_feat_dim = 1  # default to scalar edge weights if enabled but not specified
+
+        self.use_bwd_weights = getattr(cfg, "use_bwd_weights", False)
+
+        # Backbone: simple linear projection with LN → GELU
         self.pre = nn.Sequential(
             nn.Linear(nfeat, cfg.hidden),
             nn.LayerNorm(cfg.hidden),
             nn.GELU(),
         )
-        self.cell = GCLSTMCell(
-            fin=cfg.hidden, hid=cfg.hidden, k=cfg.k,
-            alpha_init=cfg.alpha, att_hidden=cfg.att_hidden,
-            use_attention=True,
+
+        # Recurrent graph-temporal cell (directional MPNN inside)
+        self.cell = GraphLSTMCell(
+            fin=cfg.hidden, hid=cfg.hidden,
+            edge_dim=edge_feat_dim,
+            alpha_init=cfg.alpha,
+            att_hidden=cfg.att_hidden,
+            compute_attention=getattr(cfg, "compute_attention", False),
+            use_edge_weight=getattr(cfg, "use_edge_weight", True),
+            use_bwd_weights=getattr(cfg, "use_bwd_weights", False),
+            alpha_mode=getattr(cfg, "alpha_mode", "scalar"),
         )
-        # Edge decoder
+
+        # Edge decoder on pairwise node states:
+        #   features = [h_s, h_t, h_s ⊙ h_t, |h_s − h_t|]
         self.dec_edge = mlp(
-            d_in=cfg.hidden * 2,
+            d_in=cfg.hidden * 4,
             d_hidden=cfg.hidden,
             depth=cfg.depth_edge,
             dropout=cfg.dropout,
+            out_dim=1,
+            out_activation=None,
         )
 
     def forward(
@@ -240,45 +380,61 @@ class IOGNN_Z(nn.Module):
         tgt_batch: List[Data],
     ) -> Tuple[Tensor, Tensor, Tensor]:
         """
+        Forward pass over a batch of graph sequences with respective target graphs.
+
+        Parameters
+        ----------
+        seq_batch : List[List[Data]]
+            For each sample, a list of `Data` objects (historical window).
+        tgt_batch : List[Data]
+            For each sample, the target `Data` (the graph to predict on).
+
         Returns
         -------
-        z_preds : Tensor[∑E]  edge-flow predictions (concatenated)
-        att_out / att_in : Tensor[∑E]  analysis-only attention from output gate
+        z_concat : Tensor[∑E]
+            Concatenated edge predictions across the mini-batch.
+        att_out : Tensor[∑E]
+            Analysis-only attention (outgoing) from the output gate (if enabled).
+        att_in : Tensor[∑E]
+            Analysis-only attention (incoming) from the output gate (if enabled).
         """
         z_outs, att_o, att_i = [], [], []
-        for seq, tgt in zip(seq_batch, tgt_batch):
-            h = c = None
-            for g in seq:  # W-step history
-                h, c = self.cell(self.pre(g.x), g.edge_index, g.edge_attr, h, c)
 
-            # analysis-only attention (from output gate)
-            ao, ai = self.cell.Ox.compute_att(h,tgt.edge_index, tgt.edge_attr)
+        for seq, tgt in zip(seq_batch, tgt_batch):
+            # Run the recurrent cell over the historical sequence
+            h = c = None
+            for g in seq:
+                ew_bwd = getattr(g, "edge_attr_bwd", None) if self.use_bwd_weights else None
+                h, c = self.cell(self.pre(g.x), g.edge_index, g.edge_attr, h, c, ew_bwd=ew_bwd)
+
+            # Analysis-only attention on the target graph (from Ox gate)
+            ao, ai = self.cell.Ox.compute_att(h, tgt.edge_index, tgt.edge_attr)
             att_o.append(ao); att_i.append(ai)
 
+            # Edge-wise decoding on the target graph
             s, t = tgt.edge_index
-            pairs = torch.cat([h[s], h[t]], dim=1)
-            z_outs.append(self.dec_edge(pairs).squeeze(-1))  # [E]
+            hs, ht = h[s], h[t]
+            pair_feat = torch.cat([hs, ht, hs * ht, torch.abs(hs - ht)], dim=1)
+            z_outs.append(self.dec_edge(pair_feat).squeeze(-1))  # [E]
 
         return torch.cat(z_outs), torch.cat(att_o), torch.cat(att_i)
 
-    # ---------- convenience for full-forward PINN ----------
     def full_forward(
         self,
         loader: torch.utils.data.DataLoader,
         device: torch.device,
-    ) -> tuple[Tensor, List[Data]]:
+    ) -> Tuple[Tensor, List[Data]]:
         """
-        Forward over ALL graphs in `loader` and concatenate edge predictions.
+        Convenience: run forward over ALL graphs in `loader` and concat predictions.
 
-        Parameters
-        ----------
-        loader : DataLoader over GraphWindowDataset (typically train split), batch_size=1, shuffle=False
-        device : torch.device
+        Keeps autograd graph for downstream PINN loss computation.
 
         Returns
         -------
-        z_cat_all : Tensor[∑E]   concatenated edge predictions (autograd intact)
-        graphs    : list[Data]    list aligned with `z_cat_all` slicing
+        z_cat_all : Tensor[∑E]
+            Concatenated edge predictions.
+        graphs    : List[Data]
+            Target graphs in the same order (for slicing back).
         """
         outs: List[Tensor] = []
         graphs: List[Data] = []
@@ -295,25 +451,77 @@ class IOGNN_Z(nn.Module):
 class IOGNN_VA(nn.Module):
     """Node-level IO-GNN (predicts next-step Value Added VÂ_n)."""
 
-    def __init__(self, nfeat: int, cfg):
+    def __init__(self, nfeat: int, *args, **kwargs):
+        """
+        Backward-compatible + keyword-friendly constructor.
+
+        Accepted call patterns:
+          - New style (positional):  IOGNN_VA(nfeat, edge_feat_dim, cfg)
+          - Old style (positional):  IOGNN_VA(nfeat, cfg)  # edge_feat_dim inferred from cfg.edge_feat_dim or None
+          - Keyword style:           IOGNN_VA(nfeat, cfg=..., edge_feat_dim=...)
+
+        Args
+        ----
+        nfeat : int
+            Node feature dimension.
+        edge_feat_dim : Optional[int]
+            Edge feature dimension (used by the recurrent graph cell).
+        cfg : object
+            Experiment/config object with hyperparameters and flags.
+        """
         super().__init__()
-        # Backbone
+
+        # Unpack cfg / edge_feat_dim from args and kwargs (backward compatible).
+        cfg = kwargs.get("cfg", None)
+        edge_feat_dim_kw = kwargs.get("edge_feat_dim", None)
+        if cfg is None:
+            if len(args) == 2:
+                edge_feat_dim, cfg = args
+            elif len(args) == 1:
+                (cfg,) = args
+                edge_feat_dim = getattr(cfg, "edge_feat_dim", None)
+            else:
+                raise TypeError(
+                    "IOGNN_VA.__init__ expected (nfeat, cfg) or (nfeat, edge_feat_dim, cfg) "
+                    "or keyword form (nfeat, cfg=..., edge_feat_dim=...)"
+                )
+        else:
+            edge_feat_dim = edge_feat_dim_kw if edge_feat_dim_kw is not None else getattr(cfg, "edge_feat_dim", None)
+
+        if getattr(cfg, "use_edge_weight", True) and (edge_feat_dim is None):
+            edge_feat_dim = 1
+
+        self.use_bwd_weights = getattr(cfg, "use_bwd_weights", False)
+        self.va_nonneg = getattr(cfg, "va_nonneg", False)
+
+        # Backbone: LN → GELU
         self.pre = nn.Sequential(
             nn.Linear(nfeat, cfg.hidden),
-            nn.GELU(),
             nn.LayerNorm(cfg.hidden),
+            nn.GELU(),
         )
-        self.cell = GCLSTMCell(
-            fin=cfg.hidden, hid=cfg.hidden, k=cfg.k,
-            alpha_init=cfg.alpha, att_hidden=cfg.att_hidden,
-            use_attention=True,
+
+        # Recurrent graph-temporal cell
+        self.cell = GraphLSTMCell(
+            fin=cfg.hidden, hid=cfg.hidden,
+            edge_dim=edge_feat_dim,
+            alpha_init=cfg.alpha,
+            att_hidden=cfg.att_hidden,
+            compute_attention=getattr(cfg, "compute_attention", False),
+            use_edge_weight=getattr(cfg, "use_edge_weight", True),
+            use_bwd_weights=getattr(cfg, "use_bwd_weights", False),
+            alpha_mode=getattr(cfg, "alpha_mode", "scalar"),
         )
-        # Node decoder
+
+        # Node decoder; optional non-negativity (Softplus) for VA
+        out_act = nn.Softplus() if self.va_nonneg else None
         self.dec_node = mlp(
             d_in=cfg.hidden,
             d_hidden=cfg.hidden,
-            depth=max(1, cfg.depth_edge - 1),  # slightly shallower by default
+            depth=max(1, cfg.depth_edge - 1),
             dropout=cfg.dropout,
+            out_dim=1,
+            out_activation=out_act,
         )
 
     def forward(
@@ -322,41 +530,49 @@ class IOGNN_VA(nn.Module):
         tgt_batch: List[Data],
     ) -> Tuple[Tensor, Tensor, Tensor]:
         """
+        Parameters
+        ----------
+        seq_batch : List[List[Data]]
+            For each sample, a list of historical graphs.
+        tgt_batch : List[Data]
+            For each sample, the target graph to decode on.
+
         Returns
         -------
-        va_preds : Tensor[∑N]  node-level VA predictions (concatenated)
-        att_out / att_in : Tensor[∑E]  analysis-only attention from output gate
+        va_concat : Tensor[∑N]
+            Concatenated node predictions across the mini-batch.
+        att_out / att_in : Tensor[∑E]
+            Analysis-only attention from Ox gate (if enabled).
         """
         va_outs, att_o, att_i = [], [], []
+
         for seq, tgt in zip(seq_batch, tgt_batch):
             h = c = None
             for g in seq:
-                h, c = self.cell(self.pre(g.x), g.edge_index, g.edge_attr, h, c)
+                ew_bwd = getattr(g, "edge_attr_bwd", None) if self.use_bwd_weights else None
+                h, c = self.cell(self.pre(g.x), g.edge_index, g.edge_attr, h, c, ew_bwd=ew_bwd)
+
             va_outs.append(self.dec_node(h).squeeze(-1))  # [N]
 
-            ao, ai = self.cell.Ox.compute_att(h,tgt.edge_index, tgt.edge_attr)
+            ao, ai = self.cell.Ox.compute_att(h, tgt.edge_index, tgt.edge_attr)
             att_o.append(ao); att_i.append(ai)
 
         return torch.cat(va_outs), torch.cat(att_o), torch.cat(att_i)
 
-    # ---------- convenience for full-forward PINN ----------
     def full_forward(
         self,
         loader: torch.utils.data.DataLoader,
         device: torch.device,
-    ) -> tuple[Tensor, List[Data]]:
+    ) -> Tuple[Tensor, List[Data]]:
         """
-        Forward over ALL graphs in `loader` and concatenate node predictions.
-
-        Parameters
-        ----------
-        loader : DataLoader over GraphWindowDataset (typically train split), batch_size=1, shuffle=False
-        device : torch.device
+        Convenience: run forward over ALL graphs in `loader` and concat predictions.
 
         Returns
         -------
-        va_cat_all : Tensor[∑N]   concatenated node predictions (autograd intact)
-        graphs     : list[Data]    list aligned with `va_cat_all` slicing
+        va_cat_all : Tensor[∑N]
+            Concatenated node predictions.
+        graphs     : List[Data]
+            Target graphs in the same order.
         """
         outs: List[Tensor] = []
         graphs: List[Data] = []
