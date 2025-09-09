@@ -240,7 +240,7 @@ def train_and_eval_fold(
     for _ in range(getattr(cfg, 'fold_epochs', 5)):
         model.train()
         for seqs, tgts in tr_ld:
-            seqs = [[g.to(cfg.device) for g in s] for s in seqs]
+            seqs = [[g.to(cfg.device) for g in s] for g in seqs]
             tgts = [g.to(cfg.device) for g in tgts]
             pred, *_ = model(seqs, tgts)
             tgt = torch.cat([g.edge_attr if edge_mode else g.va for g in tgts])
@@ -259,7 +259,7 @@ def train_and_eval_fold(
     scores = []
     with torch.no_grad():
         for seqs, tgts in vl_ld:
-            seqs = [[g.to(cfg.device) for g in s] for s in seqs]
+            seqs = [[g.to(cfg.device) for g in s] for g in seqs]
             tgts = [g.to(cfg.device) for g in tgts]
             pred, *_ = model(seqs, tgts)
             tgt = torch.cat([g.edge_attr if edge_mode else g.va for g in tgts])
@@ -338,15 +338,16 @@ def run_single(cfg: Any, seed: int, *, kind: str = "Z"):
     model = model_cls(nfeat=getattr(tr_ds, 'nfeat', 3), cfg=cfg).to(cfg.device)
     optim = torch.optim.AdamW(model.parameters(), lr=cfg.lr * 0.2, weight_decay=cfg.weight_decay)
 
-    # (NEW) Optional ReduceLROnPlateau scheduler
+    # (NEW) Optional ReduceLROnPlateau scheduler (no 'verbose' kw for older torch)
     use_sched = bool(getattr(cfg, "use_plateau_scheduler", False))
+    sched = None
     if use_sched:
         sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optim, mode="min",
+            optim,
+            mode="min",
             factor=float(getattr(cfg, "plateau_factor", 0.5)),
             patience=int(getattr(cfg, "plateau_patience", 20)),
             min_lr=float(getattr(cfg, "plateau_min_lr", 1e-5)),
-            verbose=True
         )
         sched_metric_key = str(getattr(cfg, "plateau_metric", "val_tot"))
 
@@ -510,17 +511,20 @@ def run_single(cfg: Any, seed: int, *, kind: str = "Z"):
                 msg += f" | IOIS {hist['val_IOIS'][-1]:.2e}"
             tqdm.write(msg)
 
-        # (NEW) Step LR scheduler on chosen metric
-        if use_sched:
+        # (NEW) Step LR scheduler on chosen metric (print when LR actually drops)
+        if use_sched and sched is not None:
             metric_key = sched_metric_key
-            # Safety: if selected key is NaN or missing, fall back to val_tot
             watch = hist.get(metric_key, None)
-            val_for_sched = None
-            if isinstance(watch, list) and len(watch) > 0 and np.isfinite(watch[-1]):
+            if isinstance(watch, list) and len(watch) > 0 and np.isfinite(watch[-1])):
                 val_for_sched = float(watch[-1])
             else:
                 val_for_sched = float(hist["val_tot"][-1])
+
+            prev_lr = _current_lr(optim)
             sched.step(val_for_sched)
+            new_lr = _current_lr(optim)
+            if new_lr < prev_lr:
+                tqdm.write(f"[sched] LR reduced: {prev_lr:.3e} → {new_lr:.3e} (watch={metric_key}, val={val_for_sched:.4f})")
 
         # Early stopping on total validation objective
         monitor = hist["val_tot"][-1]
