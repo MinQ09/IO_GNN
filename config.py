@@ -22,7 +22,7 @@ class Config:
 
     # ───────── Paths ─────────
     data_dir: Path = Path("/Users/mingyu/Desktop/IO_GNN-main/Data")
-    out_dir: Path = Path("/Users/mingyu/Desktop/IO_GNN-main/Results/V65")
+    out_dir: Path = Path("/Users/mingyu/Desktop/IO_GNN-main/Results/V66")
     scalers_fname: str = "scalers.pkl"
 
     # ───────── Scaling & window ─────────

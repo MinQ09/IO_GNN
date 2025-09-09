@@ -33,6 +33,7 @@ from torch_geometric.data import Data
 from torch_geometric.nn import MessagePassing
 from torch_geometric.utils import softmax, degree
 
+EPS = 1e-12
 
 # ───────────────────────── DirMPNN (Directional MPNN) ─────────────────────────
 class DirMPNN(MessagePassing):
@@ -41,14 +42,8 @@ class DirMPNN(MessagePassing):
       m_{i<-j} = phi_m([x_j, x_i, e_{j->i}])
       x'_i     = alpha * AGG_fwd(m_{i<-j}) + (1-alpha) * AGG_bwd(m_{i->j})
 
-    We separately compute forward and backward outputs; mixing via alpha happens
-    inside forward() if x_bwd_out is given.
-
-    Stabilizers added:
-      - Source row-normalization (1 / out-degree) per edge (optional).
-      - Edge multiplicative gating:
-          * scalar weight -> simple multiply
-          * multi-dim edge -> learned gate (FiLM-like), sigmoid in [0,1]
+    Forward and backward paths are computed separately; mixing via alpha can be
+    done by passing the backward output as `x_bwd_out` to forward().
     """
 
     def __init__(
@@ -59,10 +54,11 @@ class DirMPNN(MessagePassing):
         att_hidden: int = 64,
         alpha_init: float = 0.5,
         learn_alpha: bool = True,
-        alpha_mode: str = "scalar",        # 'scalar' | 'channel'
+        alpha_mode: str = "scalar",   # 'scalar' | 'channel'
         compute_attention: bool = False,
-        use_row_norm: bool = True,         # NEW
-        use_edge_mul: bool = True,         # NEW
+        # NEW: accept but (currently) do not enforce special normalization
+        use_row_norm: bool = True,
+        use_edge_mul: bool = True,
     ):
         super().__init__(aggr="add", node_dim=0)
         self.fout = fout
@@ -70,6 +66,8 @@ class DirMPNN(MessagePassing):
         self.expect_edge = edge_dim is not None
         self.compute_attention = compute_attention
         self.alpha_mode = alpha_mode
+
+        # Keep flags for future extensions; safe no-op for now
         self.use_row_norm = use_row_norm
         self.use_edge_mul = use_edge_mul
 
@@ -83,12 +81,7 @@ class DirMPNN(MessagePassing):
             nn.Linear(hidden, fout),
         )
 
-        # Optional learned gate for multi-dim edges (FiLM-like)
-        self.edge_gate = None
-        if self.expect_edge and self.use_edge_mul and (edge_dim is not None) and edge_dim > 1:
-            self.edge_gate = nn.Linear(edge_dim, fout)
-
-        # alpha (forward/backward mixing)
+        # alpha (mixing forward/backward paths)
         if alpha_mode == "scalar":
             beta = torch.logit(torch.tensor(alpha_init, dtype=torch.float32))
             self._beta = nn.Parameter(beta) if learn_alpha else beta
@@ -122,30 +115,18 @@ class DirMPNN(MessagePassing):
         x_bwd_out: Optional[Tensor] = None,  # precomputed backward output to mix
     ) -> Tensor:
         src, dst = edge_index
-
-        # Per-edge source row-normalization factor: 1 / out-degree(src)
-        if self.use_row_norm:
-            if self.expect_edge and (edge_attr is not None) and (edge_attr.dim() == 1):
-                # Weighted degree (scalar weights)
-                deg_out = degree(src, num_nodes=x.size(0), dtype=x.dtype, weight=edge_attr)
-            else:
-                deg_out = degree(src, num_nodes=x.size(0), dtype=x.dtype)
-            edge_scale = (1.0 / deg_out.clamp_min(1.0))[src]  # shape [E]
-        else:
-            edge_scale = x.new_ones(src.numel())
-
-        out_fwd = self.propagate(edge_index=edge_index, x=x, edge_attr=edge_attr, edge_scale=edge_scale)
+        out_fwd = self.propagate(edge_index=edge_index, x=x, edge_attr=edge_attr)
 
         out = out_fwd if x_bwd_out is None else (self.alpha * out_fwd + (1.0 - self.alpha) * x_bwd_out)
 
-        # analysis-only attention (not used in loss)
+        # analysis-only attention
         if self.compute_attention:
             with torch.no_grad():
                 q = self.to_q(x)  # [N, H]
                 k = self.to_k(x)  # [N, H]
                 e = (q[src] * k[dst]).sum(-1)  # [E]
-                # Apply scalar edge weight only if the layer expects edges and a 1-D edge vector is provided
-                if self.expect_edge and (edge_attr is not None) and (edge_attr.dim() == 1):
+                # Only multiply by scalar edge weights if present and expected.
+                if self.expect_edge and (edge_attr is not None) and (edge_attr.dim() == 1) and self.use_edge_mul:
                     e = e * edge_attr
                 self.last_att_out = softmax(e, index=src, num_nodes=x.size(0)).detach()
                 self.last_att_in  = softmax(e, index=dst, num_nodes=x.size(0)).detach()
@@ -155,13 +136,11 @@ class DirMPNN(MessagePassing):
 
         return out
 
-    def message(self, x_i: Tensor, x_j: Tensor, edge_attr: Optional[Tensor], edge_scale: Tensor) -> Tensor:
+    def message(self, x_i: Tensor, x_j: Tensor, edge_attr: Optional[Tensor]) -> Tensor:
         # x_j: src, x_i: dst
         if not self.expect_edge:
-            base = torch.cat([x_j, x_i], dim=-1)
-            msg = self.phi_m(base)
+            z = torch.cat([x_j, x_i], dim=-1)
         else:
-            # Always build an [E, edge_dim] edge tensor if edges are expected
             if edge_attr is None:
                 E = x_j.size(0)
                 ea = x_j.new_zeros((E, int(self.edge_dim)))
@@ -173,28 +152,15 @@ class DirMPNN(MessagePassing):
                         f"but layer was built with edge_dim={self.edge_dim}. "
                         "Set cfg.edge_feat_dim accordingly or disable edges via cfg.use_edge_weight=False."
                     )
-            base = torch.cat([x_j, x_i, ea], dim=-1)
-            msg = self.phi_m(base)
-
-            # Multiplicative edge gating to stabilize scale and encode direction strength
-            if self.use_edge_mul:
-                if ea.dim() == 2 and ea.size(-1) == 1:
-                    # Scalar weight -> simple multiply
-                    msg = msg * ea
-                elif self.edge_gate is not None:
-                    # Multi-dim edge -> learned gate (sigmoid in [0,1])
-                    gate = torch.sigmoid(self.edge_gate(ea))
-                    msg = msg * gate
-
-        # Source row-normalization (per-edge)
-        return msg * edge_scale.view(-1, 1)
+            z = torch.cat([x_j, x_i, ea], dim=-1)
+        return self.phi_m(z)
 
     def compute_att(self, x: Tensor, edge_index: Tensor, edge_attr: Optional[Tensor]):
         with torch.no_grad():
             s, t = edge_index
             q, k = self.to_q(x), self.to_k(x)
             e = (q[s] * k[t]).sum(-1)
-            if self.expect_edge and (edge_attr is not None) and (edge_attr.dim() == 1):
+            if self.expect_edge and (edge_attr is not None) and (edge_attr.dim() == 1) and self.use_edge_mul:
                 e = e * edge_attr
             att_out = softmax(e, index=s, num_nodes=x.size(0)).detach()
             att_in  = softmax(e, index=t, num_nodes=x.size(0)).detach()
@@ -204,16 +170,12 @@ class DirMPNN(MessagePassing):
 # ─────────────────────────── GraphLSTMCell (DirMPNN-based) ───────────────────────────
 class GraphLSTMCell(nn.Module):
     """
-    LSTM-style recurrent cell with directional MPNN gates.
+    LSTM-style recurrent cell whose gates are directional GNN layers (DirMPNN).
 
-    Flags:
-      - compute_attention: only controls attention computation (analysis)
-      - use_edge_weight  : controls edge_attr usage in message passing
-      - use_bwd_weights  : whether to use edge_attr_bwd for backward pass (if provided)
-      - alpha_mode       : 'scalar' or 'channel'
-      - use_row_norm     : use 1/out-degree row-normalization (recommended)
-      - use_edge_mul     : use multiplicative edge gating (recommended)
-      - residual_scale   : scale for residual skip on h (e.g., 0.1 or 1.0)
+    - For compatibility with call sites:
+        forward(x, ei, ew, h=None, c=None, ew_bwd=None)
+    - Forget gate bias = +1.0
+    - Residual on h with controllable scale
     """
 
     def __init__(
@@ -227,17 +189,20 @@ class GraphLSTMCell(nn.Module):
         use_edge_weight: bool = True,
         use_bwd_weights: bool = False,
         alpha_mode: str = "scalar",
-        use_row_norm: bool = True,      # NEW
-        use_edge_mul: bool = True,      # NEW
-        residual_scale: float = 1.0,    # NEW (try 0.1 for extra stability)
+        residual_scale: float = 0.1,
+        # NEW: accept row-norm / edge-mul flags (passed down to DirMPNN)
+        use_row_norm: bool = True,
+        use_edge_mul: bool = True,
     ):
         super().__init__()
         self.hid = hid
         self.use_edge_weight = use_edge_weight
         self.use_bwd_weights = use_bwd_weights
-        self.residual_scale = float(residual_scale)
+        self.residual_scale = residual_scale
+        self.use_row_norm = use_row_norm
+        self.use_edge_mul = use_edge_mul
 
-        def conv(fi: int, fo: int) -> DirMPNN:
+        def conv(fi: int, fo: int) -> "DirMPNN":
             return DirMPNN(
                 fin=fi,
                 fout=fo,
@@ -247,81 +212,81 @@ class GraphLSTMCell(nn.Module):
                 learn_alpha=True,
                 alpha_mode=alpha_mode,
                 compute_attention=compute_attention,
-                use_row_norm=use_row_norm,
-                use_edge_mul=use_edge_mul,
+                use_row_norm=self.use_row_norm,
+                use_edge_mul=self.use_edge_mul,
             )
 
+        # Gate-wise directional convs
         self.Fx, self.Fh = conv(fin, hid), conv(hid, hid)
         self.Ix, self.Ih = conv(fin, hid), conv(hid, hid)
         self.Ox, self.Oh = conv(fin, hid), conv(hid, hid)
         self.Gx, self.Gh = conv(fin, hid), conv(hid, hid)
 
+        # LayerNorms per gate and cell state
         self.ln_f = nn.LayerNorm(hid)
         self.ln_i = nn.LayerNorm(hid)
         self.ln_o = nn.LayerNorm(hid)
         self.ln_g = nn.LayerNorm(hid)
         self.ln_c = nn.LayerNorm(hid)
 
-        # Residual on h (initialized to identity, scaled at runtime)
+        # Residual projection on h (init ~ identity if square)
         self.hidden_proj = nn.Linear(hid, hid)
         with torch.no_grad():
             if self.hidden_proj.weight.shape[0] == self.hidden_proj.weight.shape[1]:
                 nn.init.eye_(self.hidden_proj.weight)
             else:
-                nn.init.kaiming_uniform_(self.hidden_proj.weight, a=math.sqrt(5))  # fallback
+                nn.init.kaiming_uniform_(self.hidden_proj.weight, a=math.sqrt(5))
             nn.init.constant_(self.hidden_proj.bias, 0.0)
 
-        # ── Gate biases (per-feature); forget bias = +1.0 ─────────────────
-        self.b_f = nn.Parameter(torch.ones(hid))   # forget gate bias = +1
-        self.b_i = nn.Parameter(torch.zeros(hid))  # input gate bias  = 0
-        self.b_o = nn.Parameter(torch.zeros(hid))  # output gate bias = 0
-        self.b_g = nn.Parameter(torch.zeros(hid))  # candidate bias   = 0
+        # Gate biases (forget gate bias = +1)
+        self.b_f = nn.Parameter(torch.ones(hid))
+        self.b_i = nn.Parameter(torch.zeros(hid))
+        self.b_o = nn.Parameter(torch.zeros(hid))
+        self.b_g = nn.Parameter(torch.zeros(hid))
 
     def _dir_pass(
         self,
-        conv_x: DirMPNN, conv_h: DirMPNN,
+        conv_x: "DirMPNN", conv_h: "DirMPNN",
         x: Tensor, h: Tensor,
         edge_index: Tensor,
         edge_attr: Optional[Tensor],
         edge_attr_bwd: Optional[Tensor],
     ) -> Tuple[Tensor, Tensor]:
-        # forward path outputs
-        fx = conv_x(x, edge_index, edge_attr=edge_attr)
-        fh = conv_h(h, edge_index, edge_attr=edge_attr)
-
-        # backward path outputs (mixed inside conv via alpha)
+        # Forward path (src->dst)
+        fx_fwd = conv_x(x, edge_index, edge_attr=edge_attr)
+        fh_fwd = conv_h(h, edge_index, edge_attr=edge_attr)
+        # Backward path (dst->src)
         bwd_index = edge_index.flip(0)
-        edge_attr_b = edge_attr_bwd if self.use_bwd_weights else None
-
-        fx_b = conv_x(x, bwd_index, edge_attr=edge_attr_b)
-        fh_b = conv_h(h, bwd_index, edge_attr=edge_attr_b)
-
-        fx_mixed = conv_x(x, edge_index, edge_attr=edge_attr, x_bwd_out=fx_b)
-        fh_mixed = conv_h(h, edge_index, edge_attr=edge_attr, x_bwd_out=fh_b)
-        return fx_mixed, fh_mixed
+        ea_bwd = edge_attr_bwd if self.use_bwd_weights else None
+        fx_bwd = conv_x(x, bwd_index, edge_attr=ea_bwd)
+        fh_bwd = conv_h(h, bwd_index, edge_attr=ea_bwd)
+        # Mix forward/backward via alpha inside conv
+        fx = conv_x(x, edge_index, edge_attr=edge_attr, x_bwd_out=fx_bwd)
+        fh = conv_h(h, edge_index, edge_attr=edge_attr, x_bwd_out=fh_bwd)
+        return fx, fh
 
     def forward(
         self,
         x: Tensor,                  # [N, F_in]
         ei: Tensor,                 # [2, E]
-        ew: Optional[Tensor],       # [E, D] or [E]
+        ew: Optional[Tensor],       # [E] or [E, D] (or None)
         h: Optional[Tensor] = None,
         c: Optional[Tensor] = None,
-        ew_bwd: Optional[Tensor] = None,  # optional backward weights
+        ew_bwd: Optional[Tensor] = None,  # backward-edge features (optional)
     ) -> Tuple[Tensor, Tensor]:
         n = x.size(0)
         if h is None or c is None:
             h = x.new_zeros(n, self.hid)
             c = x.new_zeros(n, self.hid)
 
-        # Gates with directional mixing inside
+        # Directional gates
         xf, hf = self._dir_pass(self.Fx, self.Fh, x, h, ei, ew, ew_bwd)
         xi, hi = self._dir_pass(self.Ix, self.Ih, x, h, ei, ew, ew_bwd)
         xo, ho = self._dir_pass(self.Ox, self.Oh, x, h, ei, ew, ew_bwd)
         xg, hg = self._dir_pass(self.Gx, self.Gh, x, h, ei, ew, ew_bwd)
 
-        # LayerNorm then add per-gate bias (forget bias = +1)
-        f = torch.sigmoid(self.ln_f(xf + hf) + self.b_f)
+        # LSTM updates
+        f = torch.sigmoid(self.ln_f(xf + hf) + self.b_f)   # forget (+1 bias)
         i = torch.sigmoid(self.ln_i(xi + hi) + self.b_i)
         o = torch.sigmoid(self.ln_o(xo + ho) + self.b_o)
         g = torch.tanh(   self.ln_g(xg + hg) + self.b_g)
@@ -329,7 +294,6 @@ class GraphLSTMCell(nn.Module):
         c_new = f * c + i * g
         h_new = o * torch.tanh(self.ln_c(c_new)) + self.residual_scale * self.hidden_proj(h)
         return h_new, c_new
-
 
 # Backward-compat alias
 GCLSTMCell = GraphLSTMCell
