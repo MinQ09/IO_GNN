@@ -15,10 +15,10 @@ class Config:
 
     # ───────── Base hyper-params ─────────
     batch_size: int = 128
-    lr: float = 0.005                      # run_single에서 실제는 lr*0.2 사용
-    weight_decay: float = 5e-4
-    epochs: int = 1000
-    patience: int = 1000
+    lr: float = 0.0025                      # run_single에서 실제는 lr*0.2 사용
+    weight_decay: float = 1e-3
+    epochs: int = 500
+    patience: int = 500
     seeds: List[int] = field(default_factory=lambda: [95])
 
     # ───────── Paths ─────────
@@ -62,9 +62,9 @@ class Config:
     plateau_metric: str = "val_tot"        # run_single의 기록 키 중 하나
 
     # ───────── Model structure ─────────
-    hidden: int = 512
+    hidden: int = 256
     k: int = 5                              # (ChebConv용, DirMPNN에선 무시됨)
-    dropout: float = 0.3
+    dropout: float = 0.4
     alpha: float = 0.7                      # (ChebConv용, DirMPNN에선 무시됨)
     att_hidden: int = 256
     depth_edge: int = 3
