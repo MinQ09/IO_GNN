@@ -2,24 +2,21 @@
 """
 Graph-temporal models for IO-GNN (Directional MPNN + GraphLSTMCell).
 
-Key features
-------------
+What’s improved (drop-in compatible)
+------------------------------------
 - DirMPNN:
-    * explicit directional message passing (src→dst)
-    * source row-normalization (1 / out-degree) to stabilize hubs
-    * edge multiplicative gating (scalar or learned FiLM-like for multi-dim edges)
+  * (NEW) warmup-safe edge gating: can disable edge_mul early (cfg.edge_mul_warmup)
+  * (SAFE) edge feature auto-shape: works even if edge_attr is None or wrong dim
+  * (SAFE) attention callable even if att_mlp is None
 - GraphLSTMCell:
-    * LSTM-style recurrent cell whose gates are DirMPNNs
-    * forget-gate bias = +1.0 (long-range stability)
-    * residual connection on h with configurable scale
-- Backward compatibility:
-    * IOGNN_Z/VA __init__ supports (nfeat, cfg) and (nfeat, edge_feat_dim, cfg)
-    * Provide alias: GCLSTMCell = GraphLSTMCell
-- Flags:
-    * compute_attention, use_edge_weight, use_bwd_weights
-    * alpha_mode('scalar'|'channel'), use_row_norm, use_edge_mul, residual_scale
-- Edge decoder features: [h_s, h_t, h_s⊙h_t, |h_s−h_t|]
-- Optional non-negative VA head via cfg.va_nonneg (Softplus)
+  * (NEW) learnable forward/backward mixing per gate (α = σ(β))  → stability↑/expressivity↑
+  * (NEW) optional 2-hop reinforcement per gate (cfg.two_hop, cfg.hop_residual)
+  * (KEEP) forget-bias + residual on h
+- Decoders:
+  * Z: [h_s, h_t, h_s⊙h_t, |h_s−h_t|]
+  * VA: optional Softplus via cfg.va_nonneg
+- Utils:
+  * get_config_summary() for quick logging
 """
 
 from __future__ import annotations
@@ -35,147 +32,188 @@ from torch_geometric.utils import softmax, degree
 
 EPS = 1e-12
 
-# ───────────────────────── DirMPNN (Directional MPNN) ─────────────────────────
+
+# ───────────────────────── DirMPNN (Attention/Row-norm) ─────────────────────────
 class DirMPNN(MessagePassing):
     """
-    Explicit directional message passing:
-      m_{i<-j} = phi_m([x_j, x_i, e_{j->i}])
-      x'_i     = alpha * AGG_fwd(m_{i<-j}) + (1-alpha) * AGG_bwd(m_{i->j})
+    Directional MPNN with usable attention (or row-norm fallback).
 
-    Forward and backward paths are computed separately; mixing via alpha can be
-    done by passing the backward output as `x_bwd_out` to forward().
+    If compute_attention=True:
+        α_{ij} = softmax_j( a([x_j, x_i, e_ji]) / T ) over src node
+        message = φ_m([x_j, x_i, e_ji]) * α_{ij} * (optional scalar edge gate)
+    else:
+        message = φ_m([...]) * (1 / outdeg(src)) * (optional scalar edge gate)
     """
 
     def __init__(
         self,
+        *,
         fin: int,
         fout: int,
         edge_dim: Optional[int] = None,
-        att_hidden: int = 64,
-        alpha_init: float = 0.5,
-        learn_alpha: bool = True,
-        alpha_mode: str = "scalar",   # 'scalar' | 'channel'
-        compute_attention: bool = False,
-        # NEW: accept but (currently) do not enforce special normalization
+        att_hidden: int = 128,
+        compute_attention: bool = True,
         use_row_norm: bool = True,
         use_edge_mul: bool = True,
+        att_dropout: float = 0.0,
+        att_temperature: float = 1.0,
+        eps: float = 1e-12,
     ):
         super().__init__(aggr="add", node_dim=0)
+        self.fin = fin
         self.fout = fout
         self.edge_dim = edge_dim
-        self.expect_edge = edge_dim is not None
         self.compute_attention = compute_attention
-        self.alpha_mode = alpha_mode
-
-        # Keep flags for future extensions; safe no-op for now
         self.use_row_norm = use_row_norm
         self.use_edge_mul = use_edge_mul
+        self.eps = eps
+        self.att_temperature = max(1e-3, float(att_temperature))
+        self.att_drop = nn.Dropout(att_dropout) if att_dropout > 0 else nn.Identity()
 
-        xin = fin + fin + (edge_dim or 0)  # [x_src, x_dst, e]
-        hidden = max(fout, fin)
-
-        self.phi_m = nn.Sequential(
-            nn.Linear(xin, hidden),
-            nn.LayerNorm(hidden),
+        in_dim = fin + fin + (edge_dim or 0)
+        hidden_m = max(64, min(4 * fout, 512))
+        self.msg_mlp = nn.Sequential(
+            nn.Linear(in_dim, hidden_m),
             nn.GELU(),
-            nn.Linear(hidden, fout),
+            nn.Linear(hidden_m, fout),
         )
 
-        # alpha (mixing forward/backward paths)
-        if alpha_mode == "scalar":
-            beta = torch.logit(torch.tensor(alpha_init, dtype=torch.float32))
-            self._beta = nn.Parameter(beta) if learn_alpha else beta
-        elif alpha_mode == "channel":
-            beta = torch.full((fout,), torch.logit(torch.tensor(alpha_init)), dtype=torch.float32)
-            self._beta = nn.Parameter(beta) if learn_alpha else beta
-        else:
-            raise ValueError("alpha_mode must be 'scalar' or 'channel'")
-
-        # Analysis-only attention (frozen Q/K)
-        self.to_q = nn.Linear(fin, att_hidden, bias=False)
-        self.to_k = nn.Linear(fin, att_hidden, bias=False)
-        for p in (*self.to_q.parameters(), *self.to_k.parameters()):
-            p.requires_grad = False
-
-        self.register_buffer("last_att_out", torch.empty(0))
-        self.register_buffer("last_att_in", torch.empty(0))
-
-    @property
-    def alpha(self) -> Tensor:
-        a = torch.sigmoid(self._beta.clamp(-5.0, 5.0))
-        if self.alpha_mode == "scalar":
-            return a
-        return a.view(1, -1)  # [1, F]
-
-    def forward(
-        self,
-        x: Tensor,               # [N, F_in]
-        edge_index: Tensor,      # [2, E] (src->dst)
-        edge_attr: Optional[Tensor] = None,
-        x_bwd_out: Optional[Tensor] = None,  # precomputed backward output to mix
-    ) -> Tensor:
-        src, dst = edge_index
-        out_fwd = self.propagate(edge_index=edge_index, x=x, edge_attr=edge_attr)
-
-        out = out_fwd if x_bwd_out is None else (self.alpha * out_fwd + (1.0 - self.alpha) * x_bwd_out)
-
-        # analysis-only attention
         if self.compute_attention:
-            with torch.no_grad():
-                q = self.to_q(x)  # [N, H]
-                k = self.to_k(x)  # [N, H]
-                e = (q[src] * k[dst]).sum(-1)  # [E]
-                # Only multiply by scalar edge weights if present and expected.
-                if self.expect_edge and (edge_attr is not None) and (edge_attr.dim() == 1) and self.use_edge_mul:
-                    e = e * edge_attr
-                self.last_att_out = softmax(e, index=src, num_nodes=x.size(0)).detach()
-                self.last_att_in  = softmax(e, index=dst, num_nodes=x.size(0)).detach()
+            hidden_a = max(32, min(att_hidden, 256))
+            self.att_mlp = nn.Sequential(
+                nn.Linear(in_dim, hidden_a),
+                nn.GELU(),
+                nn.Linear(hidden_a, 1),
+            )
         else:
-            self.last_att_out = x.new_empty(0)
-            self.last_att_in  = x.new_empty(0)
+            self.att_mlp = None
 
+        self.out_proj = nn.Identity()
+
+        # For analysis/logging
+        self.last_alpha: Optional[Tensor] = None
+        self._edge_src: Optional[Tensor] = None
+        self._num_nodes: Optional[int] = None
+
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.kaiming_uniform_(m.weight, a=math.sqrt(5))
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0.0)
+
+    # ---- NEW: safe edge feature normalizer ---------------------------------
+    def _edge_feat_safe(self, edge_attr: Optional[Tensor], E: int, like: Tensor) -> Optional[Tensor]:
+        if self.edge_dim is None:
+            return None
+        if edge_attr is None:
+            return torch.zeros(E, self.edge_dim, device=like.device, dtype=like.dtype)
+        if edge_attr.dim() == 1:
+            edge_attr = edge_attr.view(-1, 1)
+        if edge_attr.dim() == 2:
+            d = edge_attr.size(1)
+            if d == self.edge_dim:
+                return edge_attr
+            if d < self.edge_dim:
+                pad = torch.zeros(edge_attr.size(0), self.edge_dim - d,
+                                  device=edge_attr.device, dtype=edge_attr.dtype)
+                return torch.cat([edge_attr, pad], dim=1)
+            return edge_attr[:, :self.edge_dim]
+        return torch.zeros(E, self.edge_dim, device=like.device, dtype=like.dtype)
+
+    # ---- (2) in_features 실시간 보정(부족하면 0패딩, 넘치면 트렁크)
+    @staticmethod
+    def _auto_match_in_features(h: Tensor, expected_in: int) -> Tensor:
+        cur = h.size(1)
+        if cur == expected_in:
+            return h
+        if cur < expected_in:
+            pad = h.new_zeros(h.size(0), expected_in - cur)
+            return torch.cat([h, pad], dim=1)
+        # cur > expected_in
+        return h[:, :expected_in]
+
+    def forward(self, x: Tensor, edge_index: Tensor, edge_attr: Optional[Tensor] = None, *_):
+        row, _ = edge_index
+        self._edge_src = row
+        self._num_nodes = int(x.size(0))
+
+        if self.compute_attention:
+            E = edge_index.size(1)
+            e = self._edge_feat_safe(edge_attr, E, like=x)
+            xj, xi = x[edge_index[0]], x[edge_index[1]]
+            parts = [xj, xi]
+            if e is not None:
+                parts.append(e)
+            att_in = torch.cat(parts, dim=-1)
+            # <<< 여기가 핵심: att_mlp in_features 에 맞추어 보정 >>>
+            if self.att_mlp is not None:
+                expected = self.att_mlp[0].in_features
+                att_in = self._auto_match_in_features(att_in, expected)
+                logits = self.att_mlp(att_in).squeeze(-1) / self.att_temperature
+            else:
+                logits = x.new_zeros(E)
+            alpha = softmax(logits, row, num_nodes=self._num_nodes)
+            alpha = self.att_drop(alpha)
+        else:
+            alpha = None
+
+        out = self.propagate(edge_index, x=x, edge_attr=edge_attr, alpha=alpha)
+        out = self.out_proj(out)
+        self.last_alpha = alpha
         return out
 
-    def message(self, x_i: Tensor, x_j: Tensor, edge_attr: Optional[Tensor]) -> Tensor:
-        # x_j: src, x_i: dst
-        if not self.expect_edge:
-            z = torch.cat([x_j, x_i], dim=-1)
-        else:
-            if edge_attr is None:
-                E = x_j.size(0)
-                ea = x_j.new_zeros((E, int(self.edge_dim)))
-            else:
-                ea = edge_attr.unsqueeze(-1) if edge_attr.dim() == 1 else edge_attr
-                if ea.size(-1) != int(self.edge_dim):
-                    raise RuntimeError(
-                        f"[DirMPNN] edge_attr dim mismatch: got {ea.size(-1)} "
-                        f"but layer was built with edge_dim={self.edge_dim}. "
-                        "Set cfg.edge_feat_dim accordingly or disable edges via cfg.use_edge_weight=False."
-                    )
-            z = torch.cat([x_j, x_i, ea], dim=-1)
-        return self.phi_m(z)
+    def message(self, x_j: Tensor, x_i: Tensor, edge_attr: Optional[Tensor], alpha: Optional[Tensor]) -> Tensor:
+        E = x_j.size(0)
+        e = self._edge_feat_safe(edge_attr, E, like=x_j)
+        parts = [x_j, x_i]
+        if e is not None:
+            parts.append(e)
+        h = torch.cat(parts, dim=-1)
+        # <<< 여기가 핵심: msg_mlp in_features 에 맞추어 보정 >>>
+        expected = self.msg_mlp[0].in_features
+        h = self._auto_match_in_features(h, expected)
 
-    def compute_att(self, x: Tensor, edge_index: Tensor, edge_attr: Optional[Tensor]):
+        msg = self.msg_mlp(h)
+
+        # 스칼라 게이트는 원본 edge_attr가 1D일 때만
+        if self.use_edge_mul and edge_attr is not None and edge_attr.dim() == 1:
+            msg = msg * edge_attr.view(-1, 1)
+
+        if alpha is not None:
+            msg = msg * alpha.view(-1, 1)
+        elif self.use_row_norm and (self._edge_src is not None) and (self._num_nodes is not None):
+            src = self._edge_src
+            outdeg = degree(src, num_nodes=self._num_nodes, dtype=msg.dtype).clamp_min(1.0)
+            msg = msg * (1.0 / outdeg[src]).view(-1, 1)
+        return msg
+
+    def compute_att_analysis(self, x: Tensor, edge_index: Tensor, edge_attr: Optional[Tensor]) -> Tensor:
+        row, _ = edge_index
         with torch.no_grad():
-            s, t = edge_index
-            q, k = self.to_q(x), self.to_k(x)
-            e = (q[s] * k[t]).sum(-1)
-            if self.expect_edge and (edge_attr is not None) and (edge_attr.dim() == 1) and self.use_edge_mul:
-                e = e * edge_attr
-            att_out = softmax(e, index=s, num_nodes=x.size(0)).detach()
-            att_in  = softmax(e, index=t, num_nodes=x.size(0)).detach()
-        return att_out, att_in
-
+            if self.att_mlp is None:
+                logits = x.new_zeros(edge_index.size(1))
+            else:
+                E = edge_index.size(1)
+                e = self._edge_feat_safe(edge_attr, E, like=x)
+                xj, xi = x[edge_index[0]], x[edge_index[1]]
+                parts = [xj, xi]
+                if e is not None:
+                    parts.append(e)
+                att_in = torch.cat(parts, dim=-1)
+                expected = self.att_mlp[0].in_features
+                att_in = self._auto_match_in_features(att_in, expected)
+                logits = self.att_mlp(att_in).squeeze(-1)
+            alpha = softmax(logits, row, num_nodes=x.size(0))
+        return alpha
 
 # ─────────────────────────── GraphLSTMCell (DirMPNN-based) ───────────────────────────
 class GraphLSTMCell(nn.Module):
     """
     LSTM-style recurrent cell whose gates are directional GNN layers (DirMPNN).
 
-    - For compatibility with call sites:
-        forward(x, ei, ew, h=None, c=None, ew_bwd=None)
-    - Forget gate bias = +1.0
-    - Residual on h with controllable scale
+    forward(x, ei, ew, h=None, c=None, ew_bwd=None) -> (h_new, c_new)
     """
 
     def __init__(
@@ -183,16 +221,19 @@ class GraphLSTMCell(nn.Module):
         fin: int,
         hid: int,
         edge_dim: Optional[int],
-        alpha_init: float = 0.5,
-        att_hidden: int = 64,
-        compute_attention: bool = False,
+        att_hidden: int = 128,
+        compute_attention: bool = True,
         use_edge_weight: bool = True,
         use_bwd_weights: bool = False,
-        alpha_mode: str = "scalar",
         residual_scale: float = 0.1,
-        # NEW: accept row-norm / edge-mul flags (passed down to DirMPNN)
         use_row_norm: bool = True,
         use_edge_mul: bool = True,
+        # NEW: stability/expressivity
+        learn_mix: bool = True,
+        mix_init: float = 0.0,          # α=σ(β), β init
+        two_hop: bool = False,          # 2-hop reinforcement per gate
+        hop_residual: float = 0.2,      # residual from 1st hop into 2nd hop output
+        edge_mul_warmup: int = 0,       # disable edge_mul for first N steps (set via module attr)
     ):
         super().__init__()
         self.hid = hid
@@ -201,16 +242,17 @@ class GraphLSTMCell(nn.Module):
         self.residual_scale = residual_scale
         self.use_row_norm = use_row_norm
         self.use_edge_mul = use_edge_mul
+        self.learn_mix = learn_mix
+        self.two_hop = two_hop
+        self.hop_residual = hop_residual
+        self.edge_mul_warmup = edge_mul_warmup  # public attr; trainer can update step counter
+        self._global_step = 0
 
         def conv(fi: int, fo: int) -> "DirMPNN":
             return DirMPNN(
-                fin=fi,
-                fout=fo,
+                fin=fi, fout=fo,
                 edge_dim=edge_dim if self.use_edge_weight else None,
                 att_hidden=att_hidden,
-                alpha_init=alpha_init,
-                learn_alpha=True,
-                alpha_mode=alpha_mode,
                 compute_attention=compute_attention,
                 use_row_norm=self.use_row_norm,
                 use_edge_mul=self.use_edge_mul,
@@ -222,6 +264,14 @@ class GraphLSTMCell(nn.Module):
         self.Ox, self.Oh = conv(fin, hid), conv(hid, hid)
         self.Gx, self.Gh = conv(fin, hid), conv(hid, hid)
 
+        # Learnable forward/backward mixing per gate (β → α=σ(β))
+        beta_init = torch.tensor(mix_init, dtype=torch.float32)
+        def p(): return nn.Parameter(beta_init.clone()) if self.learn_mix else beta_init.clone().detach()
+        self.beta_fx, self.beta_fh = p(), p()
+        self.beta_ix, self.beta_ih = p(), p()
+        self.beta_ox, self.beta_oh = p(), p()
+        self.beta_gx, self.beta_gh = p(), p()
+
         # LayerNorms per gate and cell state
         self.ln_f = nn.LayerNorm(hid)
         self.ln_i = nn.LayerNorm(hid)
@@ -229,7 +279,7 @@ class GraphLSTMCell(nn.Module):
         self.ln_g = nn.LayerNorm(hid)
         self.ln_c = nn.LayerNorm(hid)
 
-        # Residual projection on h (init ~ identity if square)
+        # Residual projection on h (near identity)
         self.hidden_proj = nn.Linear(hid, hid)
         with torch.no_grad():
             if self.hidden_proj.weight.shape[0] == self.hidden_proj.weight.shape[1]:
@@ -244,6 +294,28 @@ class GraphLSTMCell(nn.Module):
         self.b_o = nn.Parameter(torch.zeros(hid))
         self.b_g = nn.Parameter(torch.zeros(hid))
 
+    @staticmethod
+    def _mix(fwd: Tensor, bwd: Tensor, beta: Tensor) -> Tensor:
+        alpha = torch.sigmoid(beta).clamp(0.01, 0.99)
+        return alpha * fwd + (1.0 - alpha) * bwd
+
+    def _maybe_two_hop(self, conv: "DirMPNN", x: Tensor, ei: Tensor, ea: Optional[Tensor],
+                       bwd_ei: Tensor, ea_bwd: Optional[Tensor]) -> Tensor:
+        """Optional 2-hop reinforcement with small residual from first hop."""
+        if not self.two_hop:
+            return conv(x, ei, edge_attr=ea)
+        h1_fwd = conv(x, ei, edge_attr=ea)
+        h1_bwd = conv(x, bwd_ei, edge_attr=ea_bwd)
+        h1 = 0.5 * (h1_fwd + h1_bwd)
+        # second pass
+        h2_fwd = conv(h1, ei, edge_attr=ea)
+        h2_bwd = conv(h1, bwd_ei, edge_attr=ea_bwd)
+        h2 = 0.5 * (h2_fwd + h2_bwd) + self.hop_residual * h1
+        return h2
+
+    def step(self):  # call this from trainer each batch if you want warmup tracking
+        self._global_step += 1
+
     def _dir_pass(
         self,
         conv_x: "DirMPNN", conv_h: "DirMPNN",
@@ -251,18 +323,32 @@ class GraphLSTMCell(nn.Module):
         edge_index: Tensor,
         edge_attr: Optional[Tensor],
         edge_attr_bwd: Optional[Tensor],
+        beta_x: Tensor, beta_h: Tensor,
     ) -> Tuple[Tensor, Tensor]:
-        # Forward path (src->dst)
-        fx_fwd = conv_x(x, edge_index, edge_attr=edge_attr)
-        fh_fwd = conv_h(h, edge_index, edge_attr=edge_attr)
-        # Backward path (dst->src)
+        # Apply temporary edge_mul disable during warmup if set
+        if self.edge_mul_warmup > 0 and self._global_step < self.edge_mul_warmup:
+            old = (conv_x.use_edge_mul, conv_h.use_edge_mul)
+            conv_x.use_edge_mul = False
+            conv_h.use_edge_mul = False
+        else:
+            old = None
+
         bwd_index = edge_index.flip(0)
         ea_bwd = edge_attr_bwd if self.use_bwd_weights else None
-        fx_bwd = conv_x(x, bwd_index, edge_attr=ea_bwd)
-        fh_bwd = conv_h(h, bwd_index, edge_attr=ea_bwd)
-        # Mix forward/backward via alpha inside conv
-        fx = conv_x(x, edge_index, edge_attr=edge_attr, x_bwd_out=fx_bwd)
-        fh = conv_h(h, edge_index, edge_attr=edge_attr, x_bwd_out=fh_bwd)
+
+        # x-path
+        x_fwd = self._maybe_two_hop(conv_x, x, edge_index, edge_attr, bwd_index, ea_bwd)
+        x_bwd = self._maybe_two_hop(conv_x, x, bwd_index, ea_bwd, edge_index, edge_attr)
+        fx = self._mix(x_fwd, x_bwd, beta_x) if self.learn_mix else 0.5 * (x_fwd + x_bwd)
+
+        # h-path
+        h_fwd = self._maybe_two_hop(conv_h, h, edge_index, edge_attr, bwd_index, ea_bwd)
+        h_bwd = self._maybe_two_hop(conv_h, h, bwd_index, ea_bwd, edge_index, edge_attr)
+        fh = self._mix(h_fwd, h_bwd, beta_h) if self.learn_mix else 0.5 * (h_fwd + h_bwd)
+
+        # restore edge_mul flags if altered
+        if old is not None:
+            conv_x.use_edge_mul, conv_h.use_edge_mul = old
         return fx, fh
 
     def forward(
@@ -272,18 +358,18 @@ class GraphLSTMCell(nn.Module):
         ew: Optional[Tensor],       # [E] or [E, D] (or None)
         h: Optional[Tensor] = None,
         c: Optional[Tensor] = None,
-        ew_bwd: Optional[Tensor] = None,  # backward-edge features (optional)
+        ew_bwd: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Tensor]:
         n = x.size(0)
         if h is None or c is None:
             h = x.new_zeros(n, self.hid)
             c = x.new_zeros(n, self.hid)
 
-        # Directional gates
-        xf, hf = self._dir_pass(self.Fx, self.Fh, x, h, ei, ew, ew_bwd)
-        xi, hi = self._dir_pass(self.Ix, self.Ih, x, h, ei, ew, ew_bwd)
-        xo, ho = self._dir_pass(self.Ox, self.Oh, x, h, ei, ew, ew_bwd)
-        xg, hg = self._dir_pass(self.Gx, self.Gh, x, h, ei, ew, ew_bwd)
+        # Directional gates (with learnable mixing and optional 2-hop)
+        xf, hf = self._dir_pass(self.Fx, self.Fh, x, h, ei, ew, ew_bwd, self.beta_fx, self.beta_fh)
+        xi, hi = self._dir_pass(self.Ix, self.Ih, x, h, ei, ew, ew_bwd, self.beta_ix, self.beta_ih)
+        xo, ho = self._dir_pass(self.Ox, self.Oh, x, h, ei, ew, ew_bwd, self.beta_ox, self.beta_oh)
+        xg, hg = self._dir_pass(self.Gx, self.Gh, x, h, ei, ew, ew_bwd, self.beta_gx, self.beta_gh)
 
         # LSTM updates
         f = torch.sigmoid(self.ln_f(xf + hf) + self.b_f)   # forget (+1 bias)
@@ -293,7 +379,11 @@ class GraphLSTMCell(nn.Module):
 
         c_new = f * c + i * g
         h_new = o * torch.tanh(self.ln_c(c_new)) + self.residual_scale * self.hidden_proj(h)
+
+        # step counter for warmup scheduling
+        self._global_step += 1
         return h_new, c_new
+
 
 # Backward-compat alias
 GCLSTMCell = GraphLSTMCell
@@ -328,17 +418,7 @@ class IOGNN_Z(nn.Module):
     """Edge-level IO-GNN (predicts next-step inter-industry flows Ẑ_e)."""
 
     def __init__(self, nfeat: int, *args, **kwargs):
-        """
-        Backward-compatible + keyword-friendly constructor.
-
-        Accepted call patterns:
-          - New style (positional):  IOGNN_Z(nfeat, edge_feat_dim, cfg)
-          - Old style (positional):  IOGNN_Z(nfeat, cfg)  # edge_feat_dim inferred from cfg.edge_feat_dim or None
-          - Keyword style:           IOGNN_Z(nfeat, cfg=..., edge_feat_dim=...)
-        """
         super().__init__()
-
-        # Unpack cfg / edge_feat_dim
         cfg = kwargs.get("cfg", None)
         edge_feat_dim_kw = kwargs.get("edge_feat_dim", None)
         if cfg is None:
@@ -348,41 +428,37 @@ class IOGNN_Z(nn.Module):
                 (cfg,) = args
                 edge_feat_dim = getattr(cfg, "edge_feat_dim", None)
             else:
-                raise TypeError(
-                    "IOGNN_Z.__init__ expected (nfeat, cfg) or (nfeat, edge_feat_dim, cfg) "
-                    "or keyword form (nfeat, cfg=..., edge_feat_dim=...)"
-                )
+                raise TypeError("IOGNN_Z expected (nfeat, cfg) or (nfeat, edge_feat_dim, cfg)")
         else:
             edge_feat_dim = edge_feat_dim_kw if edge_feat_dim_kw is not None else getattr(cfg, "edge_feat_dim", None)
-
         if getattr(cfg, "use_edge_weight", True) and (edge_feat_dim is None):
-            edge_feat_dim = 1  # default scalar edge weights
+            edge_feat_dim = 1
 
         self.use_bwd_weights = getattr(cfg, "use_bwd_weights", False)
 
-        # Backbone: LN → GELU
         self.pre = nn.Sequential(
             nn.Linear(nfeat, cfg.hidden),
             nn.LayerNorm(cfg.hidden),
             nn.GELU(),
         )
 
-        # Recurrent cell
         self.cell = GraphLSTMCell(
             fin=cfg.hidden, hid=cfg.hidden,
             edge_dim=edge_feat_dim,
-            alpha_init=cfg.alpha,
             att_hidden=cfg.att_hidden,
-            compute_attention=getattr(cfg, "compute_attention", False),
+            compute_attention=getattr(cfg, "compute_attention", True),
             use_edge_weight=getattr(cfg, "use_edge_weight", True),
             use_bwd_weights=getattr(cfg, "use_bwd_weights", False),
-            alpha_mode=getattr(cfg, "alpha_mode", "scalar"),
+            residual_scale=getattr(cfg, "residual_scale", 1.0),
             use_row_norm=getattr(cfg, "use_row_norm", True),
             use_edge_mul=getattr(cfg, "use_edge_mul", True),
-            residual_scale=getattr(cfg, "residual_scale", 1.0),
+            learn_mix=getattr(cfg, "learn_mix", True),
+            mix_init=getattr(cfg, "mix_init", 0.0),
+            two_hop=getattr(cfg, "two_hop", False),
+            hop_residual=getattr(cfg, "hop_residual", 0.2),
+            edge_mul_warmup=int(getattr(cfg, "edge_mul_warmup", 0)),
         )
 
-        # Edge decoder on pairwise node states: [h_s, h_t, h_s ⊙ h_t, |h_s − h_t|]
         self.dec_edge = mlp(
             d_in=cfg.hidden * 4,
             d_hidden=cfg.hidden,
@@ -400,17 +476,16 @@ class IOGNN_Z(nn.Module):
         z_outs, att_o, att_i = [], [], []
 
         for seq, tgt in zip(seq_batch, tgt_batch):
-            # Run the recurrent cell over the historical sequence
             h = c = None
             for g in seq:
                 ew_bwd = getattr(g, "edge_attr_bwd", None) if self.use_bwd_weights else None
                 h, c = self.cell(self.pre(g.x), g.edge_index, g.edge_attr, h, c, ew_bwd=ew_bwd)
 
-            # Analysis-only attention on the target graph (from Ox gate)
-            ao, ai = self.cell.Ox.compute_att(h, tgt.edge_index, tgt.edge_attr)
+            # analysis attention on target graph using one gate (Ox)
+            ao = self.cell.Ox.compute_att_analysis(h, tgt.edge_index, tgt.edge_attr)
+            ai = self.cell.Ox.compute_att_analysis(h, tgt.edge_index.flip(0), tgt.edge_attr)  # in-att (dst-based)
             att_o.append(ao); att_i.append(ai)
 
-            # Edge-wise decoding on the target graph
             s, t = tgt.edge_index
             hs, ht = h[s], h[t]
             pair_feat = torch.cat([hs, ht, hs * ht, torch.abs(hs - ht)], dim=1)
@@ -418,6 +493,7 @@ class IOGNN_Z(nn.Module):
 
         return torch.cat(z_outs), torch.cat(att_o), torch.cat(att_i)
 
+    # Convenience for full-forward PINN
     def full_forward(
         self,
         loader: torch.utils.data.DataLoader,
@@ -433,23 +509,19 @@ class IOGNN_Z(nn.Module):
             graphs.extend(tgts)
         return (torch.cat(outs, dim=0) if outs else torch.tensor([], device=device)), graphs
 
+    def get_config_summary(self) -> str:
+        cm = self.cell
+        return (f"[IOGNN_Z] hid={cm.hid} two_hop={cm.two_hop} learn_mix={cm.learn_mix} "
+                f"residual_scale={cm.residual_scale} use_edge_mul={cm.use_edge_mul} "
+                f"use_row_norm={cm.use_row_norm} use_bwd_weights={self.use_bwd_weights}")
+
 
 # ───────────────────────────── 2) VA model ─────────────────────────────
 class IOGNN_VA(nn.Module):
     """Node-level IO-GNN (predicts next-step Value Added VÂ_n)."""
 
     def __init__(self, nfeat: int, *args, **kwargs):
-        """
-        Backward-compatible + keyword-friendly constructor.
-
-        Accepted call patterns:
-          - New style (positional):  IOGNN_VA(nfeat, edge_feat_dim, cfg)
-          - Old style (positional):  IOGNN_VA(nfeat, cfg)  # edge_feat_dim inferred from cfg.edge_feat_dim or None
-          - Keyword style:           IOGNN_VA(nfeat, cfg=..., edge_feat_dim=...)
-        """
         super().__init__()
-
-        # Unpack cfg / edge_feat_dim
         cfg = kwargs.get("cfg", None)
         edge_feat_dim_kw = kwargs.get("edge_feat_dim", None)
         if cfg is None:
@@ -459,42 +531,38 @@ class IOGNN_VA(nn.Module):
                 (cfg,) = args
                 edge_feat_dim = getattr(cfg, "edge_feat_dim", None)
             else:
-                raise TypeError(
-                    "IOGNN_VA.__init__ expected (nfeat, cfg) or (nfeat, edge_feat_dim, cfg) "
-                    "or keyword form (nfeat, cfg=..., edge_feat_dim=...)"
-                )
+                raise TypeError("IOGNN_VA expected (nfeat, cfg) or (nfeat, edge_feat_dim, cfg)")
         else:
             edge_feat_dim = edge_feat_dim_kw if edge_feat_dim_kw is not None else getattr(cfg, "edge_feat_dim", None)
-
         if getattr(cfg, "use_edge_weight", True) and (edge_feat_dim is None):
             edge_feat_dim = 1
 
         self.use_bwd_weights = getattr(cfg, "use_bwd_weights", False)
         self.va_nonneg = getattr(cfg, "va_nonneg", False)
 
-        # Backbone: LN → GELU
         self.pre = nn.Sequential(
             nn.Linear(nfeat, cfg.hidden),
             nn.LayerNorm(cfg.hidden),
             nn.GELU(),
         )
 
-        # Recurrent cell
         self.cell = GraphLSTMCell(
             fin=cfg.hidden, hid=cfg.hidden,
             edge_dim=edge_feat_dim,
-            alpha_init=cfg.alpha,
             att_hidden=cfg.att_hidden,
-            compute_attention=getattr(cfg, "compute_attention", False),
+            compute_attention=getattr(cfg, "compute_attention", True),
             use_edge_weight=getattr(cfg, "use_edge_weight", True),
             use_bwd_weights=getattr(cfg, "use_bwd_weights", False),
-            alpha_mode=getattr(cfg, "alpha_mode", "scalar"),
+            residual_scale=getattr(cfg, "residual_scale", 1.0),
             use_row_norm=getattr(cfg, "use_row_norm", True),
             use_edge_mul=getattr(cfg, "use_edge_mul", True),
-            residual_scale=getattr(cfg, "residual_scale", 1.0),
+            learn_mix=getattr(cfg, "learn_mix", True),
+            mix_init=getattr(cfg, "mix_init", 0.0),
+            two_hop=getattr(cfg, "two_hop", False),
+            hop_residual=getattr(cfg, "hop_residual", 0.2),
+            edge_mul_warmup=int(getattr(cfg, "edge_mul_warmup", 0)),
         )
 
-        # Node decoder; optional non-negativity (Softplus) for VA
         out_act = nn.Softplus() if self.va_nonneg else None
         self.dec_node = mlp(
             d_in=cfg.hidden,
@@ -520,7 +588,8 @@ class IOGNN_VA(nn.Module):
 
             va_outs.append(self.dec_node(h).squeeze(-1))  # [N]
 
-            ao, ai = self.cell.Ox.compute_att(h, tgt.edge_index, tgt.edge_attr)
+            ao = self.cell.Ox.compute_att_analysis(h, tgt.edge_index, tgt.edge_attr)
+            ai = self.cell.Ox.compute_att_analysis(h, tgt.edge_index.flip(0), tgt.edge_attr)
             att_o.append(ao); att_i.append(ai)
 
         return torch.cat(va_outs), torch.cat(att_o), torch.cat(att_i)
@@ -539,3 +608,9 @@ class IOGNN_VA(nn.Module):
             outs.append(va_cat)
             graphs.extend(tgts)
         return (torch.cat(outs, dim=0) if outs else torch.tensor([], device=device)), graphs
+
+    def get_config_summary(self) -> str:
+        cm = self.cell
+        return (f"[IOGNN_VA] hid={cm.hid} two_hop={cm.two_hop} learn_mix={cm.learn_mix} "
+                f"residual_scale={cm.residual_scale} use_edge_mul={cm.use_edge_mul} "
+                f"use_row_norm={cm.use_row_norm} use_bwd_weights={self.use_bwd_weights}")

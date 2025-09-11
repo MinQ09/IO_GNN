@@ -1,4 +1,4 @@
-# config.py — improved (patched)
+# config.py — drop-in compatible with the patched model/run_single
 from __future__ import annotations
 
 from dataclasses import dataclass, field, asdict, replace
@@ -14,16 +14,16 @@ class Config:
     """Top-level configuration for all IO-GNN runs."""
 
     # ───────── Base hyper-params ─────────
-    batch_size: int = 64
-    lr: float = 0.005                         # Effective lr in run_single is lr*0.2; keep this and use scheduler to decay
+    batch_size: int = 128
+    lr: float = 0.005                      # run_single에서 실제는 lr*0.2 사용
     weight_decay: float = 5e-4
-    epochs: int = 1000                        # Longer training for stability (was 500)
-    patience: int = 200                       # Tighter early stop (was 300)
-    seeds: List[int] = field(default_factory=lambda: [123])
+    epochs: int = 500
+    patience: int = 500
+    seeds: List[int] = field(default_factory=lambda: [95])
 
     # ───────── Paths ─────────
     data_dir: Path = Path("/Users/mingyu/Desktop/IO_GNN-main/Data")
-    out_dir: Path = Path("/Users/mingyu/Desktop/IO_GNN-main/Results/V71")
+    out_dir: Path = Path("/Users/mingyu/Desktop/IO_GNN-main/Results/V72")
     scalers_fname: str = "scalers.pkl"
 
     # ───────── Scaling & window ─────────
@@ -31,6 +31,10 @@ class Config:
     scale_node_feats: bool = True
     scale_targets: bool = True
     save_scalers: bool = True
+    save_val_preds: bool = True            # run_single에서 VAL 저장 토글
+
+    # ───────── Validation cadence ─────────
+    val_every: int = 10                    # run_single이 주기적으로 출력
 
     # ───────── Rolling-Window CV ─────────
     rolling_val: bool = False
@@ -38,46 +42,53 @@ class Config:
     rolling_train_size: int | None = None
     rolling_test_size: int = 1
     rolling_gap: int = 0
-    fold_epochs: int = 5  # reserved for RW-CV inner training epochs
+    fold_epochs: int = 5                   # RW-CV 내부 에폭
 
     # ───────── PINN / multi-task ─────────
-    lambda_max: float = 2.0                   # Slightly larger cap to avoid vanishing adaptive λ
-    warmup: int = 50
+    lambda_max: float = 2.0                # adaptive λ 상한
+    warmup: int = 50                       # adaptive λ warmup step
+    # (아래 둘은 구버전 호환용; 쓰지 않아도 무방)
     beta_x: float = 0.0
     beta_init: float = 0.1
 
     # Full-forward PINN cadence (1 = every batch). Larger = faster/approximate.
     pinn_full_every: int = 5
 
-    # ───────── LR scheduler (recommended) ─────────
-    # These are read/used by run_single.py when you add ReduceLROnPlateau.
+    # ───────── LR scheduler (optional, run_single에서 사용 가능) ─────────
     use_plateau_scheduler: bool = True
     plateau_factor: float = 0.5
     plateau_patience: int = 20
     plateau_min_lr: float = 1e-5
-    plateau_metric: str = "val_tot"          # Which metric to watch (matches run_single logging keys)
+    plateau_metric: str = "val_tot"        # run_single의 기록 키 중 하나
 
     # ───────── Model structure ─────────
     hidden: int = 512
-    k: int = 5
+    k: int = 5                              # (ChebConv용, DirMPNN에선 무시됨)
     dropout: float = 0.3
-    alpha: float = 0.7
+    alpha: float = 0.7                      # (ChebConv용, DirMPNN에선 무시됨)
     att_hidden: int = 256
     depth_edge: int = 3
 
     # ───────── Graph/edge options (DirMPNN / GraphLSTMCell) ─────────
     # If use_edge_weight=True and edge_feat_dim is None, the model assumes scalar edges (dim=1).
-    edge_feat_dim: Optional[int] = None       # None -> infer (usually 1 if use_edge_weight=True)
-    use_edge_weight: bool = True              # Include edge_attr in message passing
-    use_bwd_weights: bool = False             # Use edge_attr_bwd on backward pass
-    compute_attention: bool = True            # Compute analysis-only attention scores (no-grad)
-    alpha_mode: str = "scalar"                # 'scalar' or 'channel' mixing of fwd/bwd
-    va_nonneg: bool = True                    # Apply Softplus head for VA prediction
+    edge_feat_dim: Optional[int] = None     # None → 보통 1로 추정됨
+    use_edge_weight: bool = True            # edge_attr 메시지패싱 포함
+    use_bwd_weights: bool = False           # 역방향 edge_attr_bwd 사용
+    compute_attention: bool = True          # 분석용 attention 점수 계산(무미분)
+    alpha_mode: str = "scalar"              # (예전 API 호환)
+    va_nonneg: bool = True                  # VA 헤드 Softplus
 
     # Directional normalization & gating
-    use_row_norm: bool = True                 # Source row-normalization (1/out-degree) per edge
-    use_edge_mul: bool = True                 # Multiplicative edge gating (scalar multiply or learned gate)
-    residual_scale: float = 0.1               # Residual skip scale for h in GraphLSTMCell (e.g., 0.1 ~ 1.0)
+    use_row_norm: bool = True               # 1/out-degree 가중
+    use_edge_mul: bool = True               # 스칼라 edge 곱 게이팅
+    residual_scale: float = 0.1             # LSTM h 잔차 스케일
+
+    # ───────── New model options (patched) ─────────
+    learn_mix: bool = True                  # fwd/bwd 혼합 가중 학습 (β → α=σ(β))
+    mix_init: float = 0.0                   # 혼합 가중 초기 β
+    two_hop: bool = False                   # 2-hop reinforcement
+    hop_residual: float = 0.2               # 1→2 hop residual 비율
+    edge_mul_warmup: int = 0                # 초반 N스텝 edge_mul 비활성화
 
     # ───────── Sweep (non-grid) ─────────
     lambda_candidates: List[float] = field(default_factory=lambda: [0, 1])
@@ -130,13 +141,16 @@ class Config:
         assert self.window >= 1, "window length must be ≥ 1"
         assert self.alpha_mode in {"scalar", "channel"}, "alpha_mode must be 'scalar' or 'channel'"
         assert self.residual_scale >= 0.0, "residual_scale must be ≥ 0.0"
+        assert self.val_every >= 1, "val_every must be ≥ 1"
+        assert self.hop_residual >= 0.0, "hop_residual must be ≥ 0.0"
+        assert self.edge_mul_warmup >= 0, "edge_mul_warmup must be ≥ 0"
 
         if self.edge_feat_dim is not None:
             assert isinstance(self.edge_feat_dim, int) and self.edge_feat_dim >= 1, \
                 "edge_feat_dim must be None or an integer ≥ 1"
 
         if self.use_plateau_scheduler:
-            assert self.plateau_factor > 0 and self.plateau_factor < 1.0, "plateau_factor must be in (0,1)"
+            assert 0 < self.plateau_factor < 1.0, "plateau_factor must be in (0,1)"
             assert self.plateau_patience >= 1, "plateau_patience must be ≥ 1"
             assert self.plateau_min_lr > 0, "plateau_min_lr must be > 0"
             assert self.plateau_metric in {
@@ -179,7 +193,6 @@ class Config:
     def generate_grid_configs(self) -> List["Config"]:
         """Return a list of immutable Config objects – one per grid point."""
         if not self.grid_search:
-            # For non-grid runs, keep a single normalized copy (device will be recomputed in __post_init__)
             base = asdict(self)
             base.pop("device", None)
             return [Config(**base)]
@@ -212,8 +225,7 @@ class Config:
                 seeds=[seed],
                 out_dir=(self.out_dir / f"grid_{i:03d}_{h}h_{k}k_dp{dp}_{self._lr_tag(lr)}_lam{lam}"),
             )
-            # Re-run post init validations and ensure dir exists
-            cfg.__post_init__()
+            cfg.__post_init__()                # re-validate & ensure directories
             configs.append(cfg)
         return configs
 
