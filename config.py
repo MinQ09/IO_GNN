@@ -17,8 +17,8 @@ class Config:
     batch_size: int = 128
     lr: float = 0.005                      # run_single에서 실제는 lr*0.2 사용
     weight_decay: float = 5e-4
-    epochs: int = 500
-    patience: int = 500
+    epochs: int = 1000
+    patience: int = 1000
     seeds: List[int] = field(default_factory=lambda: [95])
 
     # ───────── Paths ─────────
@@ -91,7 +91,7 @@ class Config:
     edge_mul_warmup: int = 0                # 초반 N스텝 edge_mul 비활성화
 
     # ───────── Sweep (non-grid) ─────────
-    lambda_candidates: List[float] = field(default_factory=lambda: [0, 1])
+    lambda_candidates: List[float] = field(default_factory=lambda: [0, 0.1])
     beta_candidates:   List[float] = field(default_factory=lambda: [0.0])
 
     # ───────── Grid-search flags/axes ─────────
